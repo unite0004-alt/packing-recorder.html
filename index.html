@@ -101,6 +101,7 @@
   .badge.err{color:var(--rec);border-color:#5e2420}
   .badge.up{color:var(--warn);border-color:#5e4a1c}
   .rec-actions{display:flex;gap:8px;margin-top:11px}
+  .err-msg{margin-top:9px;font-family:var(--mono);font-size:11px;line-height:1.5;color:#ff8b82;background:#2a1614;border:1px solid #5e2420;border-radius:8px;padding:8px 10px;word-break:break-all}
   .rec-actions button{flex:1;font-family:var(--mono);font-size:12px;font-weight:700;padding:9px;border-radius:9px;border:1px solid var(--line);background:var(--panel-2)}
   .rec-actions .del{color:var(--rec);border-color:#3a2522}
   .empty{text-align:center;color:var(--ink-dim);padding:48px 20px;font-size:14px;line-height:1.7}
@@ -660,8 +661,10 @@ async function dropboxUpload(rec){
   const folder=(settings.dFolder||'').trim();
   const path='/'+(folder?folder.replace(/^\/|\/$/g,'')+'/':'')+rec.filename;
   const arg={path,mode:'add',autorename:true,mute:true};
-  const r=await fetch('https://content.dropboxapi.com/2/files/upload',{method:'POST',headers:{'Authorization':'Bearer '+tok,'Dropbox-API-Arg':JSON.stringify(arg),'Content-Type':'application/octet-stream'},body:rec.blob});
-  if(!r.ok){const t=await r.text();throw new Error('Dropbox 上傳失敗 '+r.status+' '+t.slice(0,120));}
+  // HTTP headers are ASCII-only; Dropbox requires non-ASCII escaped as \uXXXX
+  const argHeader=JSON.stringify(arg).replace(/[\u007f-\uffff]/g,c=>'\\u'+('0000'+c.charCodeAt(0).toString(16)).slice(-4));
+  const r=await fetch('https://content.dropboxapi.com/2/files/upload',{method:'POST',headers:{'Authorization':'Bearer '+tok,'Dropbox-API-Arg':argHeader,'Content-Type':'application/octet-stream'},body:rec.blob});
+  if(!r.ok){const t=await r.text();throw new Error('Dropbox '+r.status+'：'+t.slice(0,160));}
   return true;
 }
 
@@ -707,17 +710,22 @@ async function refreshHistory(){
   const all=await dbAll();
   if(!all.length){ wrap.innerHTML='<div class="empty">還沒有出貨紀錄。<br>回到「錄影」分頁，掃描第一筆單號吧。</div>'; return; }
   wrap.innerHTML='';
+  const esc=s=>String(s||'').replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));
   for(const r of all){
     const el=document.createElement('div');el.className='rec-item';
     const badge=(label,st)=>{const cls=st==='done'?'ok':st==='err'?'err':st==='up'?'up':'';const ic=st==='done'?'✓':st==='err'?'✗':st==='up'?'⟳':'·';return `<span class="badge ${cls}">${label} ${ic}</span>`;};
+    const errs=[];
+    if(r.up&&r.up.g==='err'&&r.up.gmsg)errs.push('Drive：'+esc(r.up.gmsg));
+    if(r.up&&r.up.d==='err'&&r.up.dmsg)errs.push('Dropbox：'+esc(r.up.dmsg));
     el.innerHTML=`
-      <div class="head"><div class="no">${r.orderNo||'(無單號)'}</div></div>
-      <div class="meta">${stamp(new Date(r.createdAt))} · ${humanSize(r.size)} · ${r.filename}</div>
+      <div class="head"><div class="no">${esc(r.orderNo)||'(無單號)'}</div></div>
+      <div class="meta">${stamp(new Date(r.createdAt))} · ${humanSize(r.size)} · ${esc(r.filename)}</div>
       <div class="badges">
         ${settings.gEnabled?badge('Drive',r.up&&r.up.g):''}
         ${settings.dEnabled?badge('Dropbox',r.up&&r.up.d):''}
         ${(!settings.gEnabled&&!settings.dEnabled)?'<span class="badge">本機已存</span>':''}
       </div>
+      ${errs.length?`<div class="err-msg">${errs.join('<br>')}</div>`:''}
       <div class="rec-actions">
         <button data-act="share" data-id="${r.id}">分享/下載</button>
         <button data-act="retry" data-id="${r.id}">重新上傳</button>
