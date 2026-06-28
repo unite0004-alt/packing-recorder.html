@@ -397,25 +397,16 @@ function showFocusRing(x,y){
 }
 
 /* ---------- SCAN ENGINE ----------
-   Speed/accuracy strategy (Alipay-like):
-   - native BarcodeDetector (GPU) when available; ZXing fallback for iOS Safari
-   - decode ONLY the centre box (ROI), not the whole frame
-   - limit to the barcode types actually used → far fewer combinations to try
+   - Android (has BarcodeDetector): native GPU decode on the whole live frame — fast & reliable
+   - iPhone/Safari (no BarcodeDetector): ZXing decodeFromStream (the proven path)
    - continuous autofocus (in getCamera) + optional torch
 */
-const BD_FORMATS=['qr_code','code_128','code_39','code_93','ean_13','ean_8','itf','codabar','upc_a','upc_e','data_matrix'];
+const BD_FORMATS=['qr_code','code_128','code_39','code_93','ean_13','ean_8','itf','codabar','upc_a','upc_e','data_matrix','pdf417','aztec'];
 let detector=null, zxingReader=null, legacyZxing=false, scanRAF=null, scanBusy=false, torchOn=false;
-const scanCanvas=document.createElement('canvas');
-const sctx=scanCanvas.getContext('2d',{willReadFrequently:true});
 
 function ensureZXing(){
   if(zxingReader)return zxingReader;
-  try{
-    const F=ZXing.BarcodeFormat, H=ZXing.DecodeHintType, hints=new Map();
-    hints.set(H.POSSIBLE_FORMATS,[F.QR_CODE,F.CODE_128,F.CODE_39,F.EAN_13,F.ITF,F.CODABAR]);
-    hints.set(H.TRY_HARDER,true);
-    zxingReader=new ZXing.BrowserMultiFormatReader(hints);
-  }catch(e){ zxingReader=new ZXing.BrowserMultiFormatReader(); }
+  zxingReader=new ZXing.BrowserMultiFormatReader();   // all formats incl. QR — matches the known-good path
   return zxingReader;
 }
 function stopScanEngine(){
@@ -430,50 +421,42 @@ async function startScan(){
     state='scanning'; render(); setStatus('把條碼 / QR Code 對準框內…');
     stopStream();
     stream=await getCamera(false);
-    preview.srcObject=stream; preview.muted=true; await preview.play().catch(()=>{});
+    preview.srcObject=stream; preview.muted=true; preview.playsInline=true; await preview.play().catch(()=>{});
     preview.style.display='block'; canvas.style.display='none';
     await waitForDims(preview);
     torchOn=false; scanBusy=false; detector=null; legacyZxing=false;
 
+    // prefer native detector, but only with formats it actually supports
     if('BarcodeDetector' in window){
-      try{ detector=new BarcodeDetector({formats:BD_FORMATS}); }
-      catch(_){ try{detector=new BarcodeDetector();}catch(__){detector=null;} }
+      try{
+        let supported=BD_FORMATS;
+        if(BarcodeDetector.getSupportedFormats){
+          const s=await BarcodeDetector.getSupportedFormats();
+          supported=BD_FORMATS.filter(f=>s.includes(f));
+        }
+        detector=supported.length?new BarcodeDetector({formats:supported}):new BarcodeDetector();
+      }catch(_){ detector=null; }
     }
-    if(!detector){
+
+    if(detector){
+      scanLoop();
+    }else{
       if(typeof ZXing==='undefined'){toast('條碼元件載入中，請稍候再試');return;}
       ensureZXing();
-      if(typeof zxingReader.decodeFromCanvas!=='function'){
-        // last-resort: whole-frame continuous decode (older ZXing builds)
-        legacyZxing=true;
-        zxingReader.decodeFromStream(stream,preview,(res)=>{ if(res)onScanned(res.getText()); });
-        render(); return;
-      }
+      legacyZxing=true;
+      zxingReader.decodeFromStream(stream,preview,(res)=>{ if(res)onScanned(res.getText()); });
     }
-    scanLoop();
     render();
   }catch(e){ handleCamError(e); }
 }
 
 async function scanLoop(){
-  if(state!=='scanning')return;
-  if(!scanBusy && preview.videoWidth){
+  if(state!=='scanning'||!detector)return;
+  if(!scanBusy && preview.readyState>=2 && preview.videoWidth){
     scanBusy=true;
     try{
-      const vw=preview.videoWidth, vh=preview.videoHeight;
-      // centre ROI ~ matches the on-screen reticle (86% wide, ~1.1 aspect)
-      let rw=Math.round(vw*0.86), rh=Math.round(rw/1.1);
-      if(rh>vh){ rh=Math.round(vh*0.92); }
-      const rx=Math.round((vw-rw)/2), ry=Math.round((vh-rh)/2);
-      scanCanvas.width=rw; scanCanvas.height=rh;
-      sctx.drawImage(preview, rx, ry, rw, rh, 0, 0, rw, rh);
-      let text=null;
-      if(detector){
-        const codes=await detector.detect(scanCanvas);
-        if(codes&&codes.length)text=codes[0].rawValue;
-      }else if(zxingReader){
-        try{ const res=zxingReader.decodeFromCanvas(scanCanvas); if(res)text=res.getText(); }catch(_){}
-      }
-      if(text){ onScanned(text); return; }
+      const codes=await detector.detect(preview);   // detect on the whole live frame — no fragile cropping
+      if(codes&&codes.length){ onScanned(codes[0].rawValue); return; }
     }catch(_){}
     scanBusy=false;
   }
@@ -696,7 +679,12 @@ async function gUpload(rec,tok){
    ======================================================================== */
 function b64url(buf){return btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');}
 async function pkce(){const a=new Uint8Array(64);crypto.getRandomValues(a);const v=b64url(a.buffer);const h=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(v));return{verifier:v,challenge:b64url(h)};}
-function redirectUri(){return location.origin+location.pathname;}
+function redirectUri(){
+  const host=location.hostname.replace(/\.+$/,'');            // drop any stray trailing dot
+  const port=location.port?(':'+location.port):'';
+  let path=location.pathname.replace(/\/{2,}/g,'/');           // collapse accidental double slashes
+  return location.protocol+'//'+host+port+path;
+}
 async function dropboxConnect(){
   if(!settings.dAppKey){toast('請先填入 Dropbox App key');return;}
   const {verifier,challenge}=await pkce();
