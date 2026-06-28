@@ -53,8 +53,8 @@
   .idle-hint p{color:var(--ink-dim);font-size:14px;line-height:1.6;margin:0}
 
   /* scanner reticle */
-  .reticle{position:absolute;z-index:3;left:50%;top:46%;transform:translate(-50%,-50%);width:74%;max-width:340px;aspect-ratio:1.6/1;pointer-events:none}
-  .reticle::before,.reticle::after,.reticle b,.reticle i{content:"";position:absolute;width:30px;height:30px;border:3px solid var(--scan);filter:drop-shadow(0 0 6px rgba(182,243,58,.6))}
+  .reticle{position:absolute;z-index:3;left:50%;top:44%;transform:translate(-50%,-50%);width:86%;max-width:420px;aspect-ratio:1.1/1;pointer-events:none;border-radius:16px;box-shadow:0 0 0 9999px rgba(0,0,0,.42)}
+  .reticle::before,.reticle::after,.reticle b,.reticle i{content:"";position:absolute;width:38px;height:38px;border:4px solid var(--scan);filter:drop-shadow(0 0 6px rgba(182,243,58,.6))}
   .reticle::before{top:0;left:0;border-right:0;border-bottom:0;border-radius:6px 0 0 0}
   .reticle::after{top:0;right:0;border-left:0;border-bottom:0;border-radius:0 6px 0 0}
   .reticle b{bottom:0;left:0;border-right:0;border-top:0;border-radius:0 0 0 6px}
@@ -313,7 +313,6 @@ function dbGet(id){return new Promise((res,rej)=>{const tx=db.transaction('clips
    ======================================================================== */
 let state='idle';
 let stream=null;          // active getUserMedia stream
-let codeReader=null;      // ZXing reader
 let mediaRecorder=null;
 let chunks=[];
 let recStart=0,recTimer=null;
@@ -339,7 +338,8 @@ function render(){
     c.appendChild(mk('掃描單號','primary',startScan,'▣'));
   }else if(state==='scanning'){
     c.appendChild(mk('取消','ghost',stopAll,'✕'));
-    const man=mk('手動輸入','ghost',manualEntry,'⌨'); man.style.flex='0 0 42%'; c.appendChild(man);
+    const t=mk(torchOn?'關燈':'補光','ghost',toggleTorch,'💡'); t.style.flex='0 0 30%'; c.appendChild(t);
+    const man=mk('手動','ghost',manualEntry,'⌨'); man.style.flex='0 0 30%'; c.appendChild(man);
   }else if(state==='scanned'){
     c.appendChild(mk('重掃','ghost',()=>{currentOrder='';startScan();},'↻'));
     c.appendChild(mk('開始錄影','rec',startRecording,'●'));
@@ -396,26 +396,105 @@ function showFocusRing(x,y){
   r.style.left=x+'px';r.style.top=y+'px';r.classList.remove('go');void r.offsetWidth;r.classList.add('go');
 }
 
-/* ---------- SCAN ---------- */
+/* ---------- SCAN ENGINE ----------
+   Speed/accuracy strategy (Alipay-like):
+   - native BarcodeDetector (GPU) when available; ZXing fallback for iOS Safari
+   - decode ONLY the centre box (ROI), not the whole frame
+   - limit to the barcode types actually used → far fewer combinations to try
+   - continuous autofocus (in getCamera) + optional torch
+*/
+const BD_FORMATS=['qr_code','code_128','code_39','code_93','ean_13','ean_8','itf','codabar','upc_a','upc_e','data_matrix'];
+let detector=null, zxingReader=null, legacyZxing=false, scanRAF=null, scanBusy=false, torchOn=false;
+const scanCanvas=document.createElement('canvas');
+const sctx=scanCanvas.getContext('2d',{willReadFrequently:true});
+
+function ensureZXing(){
+  if(zxingReader)return zxingReader;
+  try{
+    const F=ZXing.BarcodeFormat, H=ZXing.DecodeHintType, hints=new Map();
+    hints.set(H.POSSIBLE_FORMATS,[F.QR_CODE,F.CODE_128,F.CODE_39,F.EAN_13,F.ITF,F.CODABAR]);
+    hints.set(H.TRY_HARDER,true);
+    zxingReader=new ZXing.BrowserMultiFormatReader(hints);
+  }catch(e){ zxingReader=new ZXing.BrowserMultiFormatReader(); }
+  return zxingReader;
+}
+function stopScanEngine(){
+  if(scanRAF){cancelAnimationFrame(scanRAF);scanRAF=null;}
+  scanBusy=false;
+  if(legacyZxing){ try{zxingReader&&zxingReader.reset();}catch(_){} }
+}
+
 async function startScan(){
   try{
-    if(typeof ZXing==='undefined'){toast('條碼元件載入中，請稍候再試');return;}
     goIdleVisualOnly();
-    state='scanning';render();setStatus('對準包裹上的條碼…');
+    state='scanning'; render(); setStatus('把條碼 / QR Code 對準框內…');
     stopStream();
     stream=await getCamera(false);
-    preview.srcObject=stream; await preview.play().catch(()=>{});
-    canvas.style.display='none'; preview.style.display='block';
-    codeReader=new ZXing.BrowserMultiFormatReader();
-    codeReader.decodeFromStream(stream,preview,(result,err)=>{
-      if(result){ onScanned(result.getText()); }
-    });
+    preview.srcObject=stream; preview.muted=true; await preview.play().catch(()=>{});
+    preview.style.display='block'; canvas.style.display='none';
+    await waitForDims(preview);
+    torchOn=false; scanBusy=false; detector=null; legacyZxing=false;
+
+    if('BarcodeDetector' in window){
+      try{ detector=new BarcodeDetector({formats:BD_FORMATS}); }
+      catch(_){ try{detector=new BarcodeDetector();}catch(__){detector=null;} }
+    }
+    if(!detector){
+      if(typeof ZXing==='undefined'){toast('條碼元件載入中，請稍候再試');return;}
+      ensureZXing();
+      if(typeof zxingReader.decodeFromCanvas!=='function'){
+        // last-resort: whole-frame continuous decode (older ZXing builds)
+        legacyZxing=true;
+        zxingReader.decodeFromStream(stream,preview,(res)=>{ if(res)onScanned(res.getText()); });
+        render(); return;
+      }
+    }
+    scanLoop();
+    render();
   }catch(e){ handleCamError(e); }
 }
+
+async function scanLoop(){
+  if(state!=='scanning')return;
+  if(!scanBusy && preview.videoWidth){
+    scanBusy=true;
+    try{
+      const vw=preview.videoWidth, vh=preview.videoHeight;
+      // centre ROI ~ matches the on-screen reticle (86% wide, ~1.1 aspect)
+      let rw=Math.round(vw*0.86), rh=Math.round(rw/1.1);
+      if(rh>vh){ rh=Math.round(vh*0.92); }
+      const rx=Math.round((vw-rw)/2), ry=Math.round((vh-rh)/2);
+      scanCanvas.width=rw; scanCanvas.height=rh;
+      sctx.drawImage(preview, rx, ry, rw, rh, 0, 0, rw, rh);
+      let text=null;
+      if(detector){
+        const codes=await detector.detect(scanCanvas);
+        if(codes&&codes.length)text=codes[0].rawValue;
+      }else if(zxingReader){
+        try{ const res=zxingReader.decodeFromCanvas(scanCanvas); if(res)text=res.getText(); }catch(_){}
+      }
+      if(text){ onScanned(text); return; }
+    }catch(_){}
+    scanBusy=false;
+  }
+  scanRAF=requestAnimationFrame(scanLoop);
+}
+
+async function toggleTorch(){
+  if(!stream)return;
+  try{
+    const track=stream.getVideoTracks()[0];
+    const caps=track.getCapabilities?track.getCapabilities():{};
+    if(!caps.torch){toast('此裝置不支援補光燈');return;}
+    torchOn=!torchOn;
+    await track.applyConstraints({advanced:[{torch:torchOn}]});
+    render();
+  }catch(e){ toast('無法切換補光燈'); }
+}
+
 function onScanned(text){
   if(state!=='scanning')return;
-  try{codeReader&&codeReader.reset();}catch(_){}
-  codeReader=null;
+  stopScanEngine();
   currentOrder=text.trim();
   $('scannedNo').textContent=currentOrder;
   if(navigator.vibrate)navigator.vibrate(60);
@@ -424,7 +503,7 @@ function onScanned(text){
 }
 function manualEntry(){
   const v=prompt('輸入單號 / 訂單編號');
-  if(v&&v.trim()){ try{codeReader&&codeReader.reset();}catch(_){}; currentOrder=v.trim(); $('scannedNo').textContent=currentOrder; state='scanned'; render(); setStatus(`單號 <b>${currentOrder}</b> ✓`); }
+  if(v&&v.trim()){ stopScanEngine(); currentOrder=v.trim(); $('scannedNo').textContent=currentOrder; state='scanned'; render(); setStatus(`單號 <b>${currentOrder}</b> ✓`); }
 }
 
 /* ---------- pick a recordable mime type (mp4 for iOS, webm for Android) ---------- */
@@ -549,7 +628,7 @@ async function shareRecord(id){
 function goIdleVisualOnly(){stopDraw();clearInterval(recTimer);}
 function goIdle(){
   goIdleVisualOnly();
-  try{codeReader&&codeReader.reset();}catch(_){}codeReader=null;
+  stopScanEngine();
   if(mediaRecorder&&mediaRecorder.state!=='inactive'){try{mediaRecorder.stop();}catch(_){}}
   mediaRecorder=null;
   stopStream();
