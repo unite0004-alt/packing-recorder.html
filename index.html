@@ -104,6 +104,16 @@
   .err-msg{margin-top:9px;font-family:var(--mono);font-size:11px;line-height:1.5;color:#ff8b82;background:#2a1614;border:1px solid #5e2420;border-radius:8px;padding:8px 10px;word-break:break-all}
   .rec-actions button{flex:1;font-family:var(--mono);font-size:12px;font-weight:700;padding:9px;border-radius:9px;border:1px solid var(--line);background:var(--panel-2)}
   .rec-actions .del{color:var(--rec);border-color:#3a2522}
+  .rec-actions .view{background:var(--scan);color:#0a0d06;border-color:var(--scan);font-size:13px}
+  /* video player overlay */
+  .player{position:fixed;inset:0;z-index:55;background:#000;transform:translateY(100%);transition:transform .28s cubic-bezier(.2,.8,.2,1);display:flex;flex-direction:column;padding-top:env(safe-area-inset-top);padding-bottom:env(safe-area-inset-bottom)}
+  .player.open{transform:translateY(0)}
+  .player-bar{display:flex;align-items:center;gap:10px;padding:12px 16px;border-bottom:1px solid var(--line);background:var(--panel)}
+  .player-title{flex:1;font-family:var(--mono);font-weight:800;font-size:15px;color:var(--scan);word-break:break-all}
+  .player-body{flex:1;display:flex;align-items:center;justify-content:center;overflow:hidden;background:#000}
+  .player-body video{width:100%;height:100%;object-fit:contain;background:#000}
+  .player-actions{display:flex;gap:10px;padding:12px 16px calc(12px + env(safe-area-inset-bottom));background:var(--panel);border-top:1px solid var(--line)}
+  .player-actions button{flex:1;font-family:var(--mono);font-weight:700;font-size:13px;padding:13px;border-radius:11px;border:1px solid var(--line);background:var(--panel-2);color:var(--ink)}
   .empty{text-align:center;color:var(--ink-dim);padding:48px 20px;font-size:14px;line-height:1.7}
 
   /* ---- settings drawer ---- */
@@ -263,6 +273,21 @@
 
   </div>
   <div class="save-bar"><button id="saveSettings">儲存設定</button></div>
+</div>
+
+<!-- video player -->
+<div class="player" id="player">
+  <div class="player-bar">
+    <div class="player-title" id="playerTitle">—</div>
+    <button class="gear" id="closePlayer" aria-label="關閉">✕</button>
+  </div>
+  <div class="player-body">
+    <video id="playerVideo" controls playsinline webkit-playsinline></video>
+  </div>
+  <div class="player-actions">
+    <button id="playerShare">分享 / 下載</button>
+    <button id="playerClose2">完成</button>
+  </div>
 </div>
 
 <div id="toast"></div>
@@ -607,6 +632,29 @@ async function shareRecord(id){
   const url=URL.createObjectURL(rec.blob);const a=document.createElement('a');a.href=url;a.download=rec.filename;a.click();setTimeout(()=>URL.revokeObjectURL(url),4000);
 }
 
+/* ---------- in-app video player (instant playback) ---------- */
+let playerURL=null, playerId=null;
+async function openPlayer(id){
+  let rec; try{ rec=await dbGet(id); }catch(_){}
+  if(!rec){ toast('找不到這支影片'); return; }
+  if(playerURL){ URL.revokeObjectURL(playerURL); playerURL=null; }
+  playerURL=URL.createObjectURL(rec.blob);
+  playerId=id;
+  const v=$('playerVideo');
+  v.src=playerURL;
+  $('playerTitle').textContent=rec.orderNo||rec.filename;
+  $('player').classList.add('open');
+  try{ await v.play(); }catch(_){ /* user can tap play */ }
+}
+function closePlayer(){
+  const v=$('playerVideo');
+  try{ v.pause(); }catch(_){}
+  v.removeAttribute('src'); try{ v.load(); }catch(_){}
+  if(playerURL){ URL.revokeObjectURL(playerURL); playerURL=null; }
+  playerId=null;
+  $('player').classList.remove('open');
+}
+
 /* ---------- reset helpers ---------- */
 function goIdleVisualOnly(){stopDraw();clearInterval(recTimer);}
 function goIdle(){
@@ -794,6 +842,9 @@ async function refreshHistory(){
       </div>
       ${errs.length?`<div class="err-msg">${errs.join('<br>')}</div>`:''}
       <div class="rec-actions">
+        <button class="view" data-act="view" data-id="${r.id}">▶ 查看影片</button>
+      </div>
+      <div class="rec-actions">
         <button data-act="share" data-id="${r.id}">分享/下載</button>
         <button data-act="retry" data-id="${r.id}">重新上傳</button>
         <button class="del" data-act="del" data-id="${r.id}">刪除</button>
@@ -802,7 +853,8 @@ async function refreshHistory(){
   }
   wrap.querySelectorAll('button[data-act]').forEach(b=>{
     b.onclick=async()=>{const id=b.dataset.id,act=b.dataset.act;
-      if(act==='share')shareRecord(id);
+      if(act==='view')openPlayer(id);
+      else if(act==='share')shareRecord(id);
       else if(act==='retry'){toast('重新上傳中…');uploadRecord(id);}
       else if(act==='del'){ if(confirm('刪除這筆紀錄與影片？此動作無法復原。')){await dbDel(id);refreshHistory();} }
     };
@@ -824,6 +876,9 @@ function showTab(which){
 $('tabCapture').onclick=()=>showTab('capture');
 $('tabHistory').onclick=()=>showTab('history');
 $('stage').addEventListener('click',(e)=>{ if(state==='scanning'||state==='recording') tapFocus(e); });
+$('closePlayer').onclick=closePlayer;
+$('playerClose2').onclick=closePlayer;
+$('playerShare').onclick=()=>{ if(playerId)shareRecord(playerId); };
 
 /* ========================================================================
    SETTINGS WIRING
