@@ -222,6 +222,8 @@
     <div class="sect">錄影選項</div>
     <div class="toggle"><div><div class="t-txt">畫面燒上浮水印</div><div class="t-sub">在影片中嵌入日期、時間與單號（存證用）</div></div><div class="sw on" id="swWatermark"></div></div>
     <div class="toggle"><div><div class="t-txt">同時錄音</div><div class="t-sub">關閉則只錄影像、沒有聲音</div></div><div class="sw on" id="swAudio"></div></div>
+    <div class="toggle"><div><div class="t-txt">高畫質錄影</div><div class="t-sub">畫面更清晰，但檔案大很多、上傳較慢；關閉為標準畫質(建議)</div></div><div class="sw" id="swHQ"></div></div>
+    <div class="toggle"><div><div class="t-txt">掃到單號發出提示音</div><div class="t-sub">掃描成功時「嗶」一聲並震動</div></div><div class="sw on" id="swBeep"></div></div>
     <div class="toggle"><div><div class="t-txt">掃到單號自動開始錄影</div><div class="t-sub">省一個步驟，掃完條碼立即進入錄影</div></div><div class="sw" id="swAutoRec"></div></div>
 
     <div class="sect" style="margin-top:24px">雲端上傳</div>
@@ -316,7 +318,7 @@ function humanSize(b){if(!b) return '—';const u=['B','KB','MB','GB'];let i=0;w
 
 /* ---------- settings (localStorage) ---------- */
 const SET_KEY='packrec.settings.v1';
-const defaults={watermark:true,audio:true,autoRec:false,gClientId:'',gFolder:'出貨錄影',gEnabled:false,dAppKey:'',dFolder:'出貨錄影',dEnabled:false};
+const defaults={watermark:true,audio:true,autoRec:false,hq:false,beep:true,gClientId:'',gFolder:'出貨錄影',gEnabled:false,dAppKey:'',dFolder:'出貨錄影',dEnabled:false};
 let settings=Object.assign({},defaults,JSON.parse(localStorage.getItem(SET_KEY)||'{}'));
 function saveSet(){localStorage.setItem(SET_KEY,JSON.stringify(settings));}
 
@@ -343,6 +345,7 @@ let chunks=[];
 let recStart=0,recTimer=null;
 let currentOrder='';
 let drawRAF=null;         // watermark canvas loop
+let recordStream=null;    // stream fed to MediaRecorder (may be the canvas stream)
 
 const preview=$('preview'), canvas=$('canvas'), ctx=canvas.getContext('2d');
 
@@ -396,7 +399,19 @@ async function getCamera(withAudio){
   }catch(_){}
   return s;
 }
-function stopStream(){if(stream){stream.getTracks().forEach(t=>t.stop());stream=null;}}
+function stopStream(){
+  if(stream){ try{stream.getTracks().forEach(t=>t.stop());}catch(_){} stream=null; }
+  try{ preview.srcObject=null; }catch(_){}
+}
+/* fully release the camera + recording pipeline — prevents the camera being left locked */
+function releaseCamera(){
+  stopDraw();
+  if(mediaRecorder && mediaRecorder.state!=='inactive'){ try{mediaRecorder.stop();}catch(_){} }
+  if(recordStream && recordStream!==stream){ try{recordStream.getTracks().forEach(t=>t.stop());}catch(_){} }
+  recordStream=null;
+  stopStream();
+  mediaRecorder=null;
+}
 function waitForDims(v){return new Promise(res=>{ if(v.videoWidth&&v.videoHeight)return res(); const t=setTimeout(res,1200); v.addEventListener('loadedmetadata',()=>{clearTimeout(t);res();},{once:true}); });}
 
 /* tap the live view to refocus (supported mainly on Android Chrome; harmless elsewhere) */
@@ -437,15 +452,46 @@ function ensureZXing(){
 function stopScanEngine(){
   if(scanRAF){cancelAnimationFrame(scanRAF);scanRAF=null;}
   scanBusy=false;
-  if(legacyZxing){ try{zxingReader&&zxingReader.reset();}catch(_){} }
+  if(legacyZxing){
+    try{
+      // stop decoding but KEEP the camera stream alive for a fast hand-off to recording
+      if(zxingReader&&typeof zxingReader.stopContinuousDecode==='function') zxingReader.stopContinuousDecode();
+      else if(zxingReader&&typeof zxingReader.stopStreams==='function') zxingReader.stopStreams();
+    }catch(_){}
+  }
+}
+
+/* ---------- scan success sound ---------- */
+let audioCtx=null;
+function initAudio(){
+  try{
+    const AC=window.AudioContext||window.webkitAudioContext;
+    if(AC&&!audioCtx)audioCtx=new AC();
+    if(audioCtx&&audioCtx.state==='suspended')audioCtx.resume();
+  }catch(_){}
+}
+function beep(){
+  if(!settings.beep)return;
+  try{
+    if(!audioCtx)return;
+    const t=audioCtx.currentTime;
+    const o=audioCtx.createOscillator(), g=audioCtx.createGain();
+    o.type='square'; o.frequency.setValueAtTime(2000,t);   // crisp scanner-gun "beep"
+    g.gain.setValueAtTime(0.0001,t);
+    g.gain.exponentialRampToValueAtTime(0.28,t+0.008);
+    g.gain.exponentialRampToValueAtTime(0.0001,t+0.13);
+    o.connect(g); g.connect(audioCtx.destination);
+    o.start(t); o.stop(t+0.14);
+  }catch(_){}
 }
 
 async function startScan(){
   try{
     goIdleVisualOnly();
+    initAudio();                       // unlock sound within this user tap (needed on iOS)
     state='scanning'; render(); setStatus('把條碼 / QR Code 對準框內…');
     stopStream();
-    stream=await getCamera(false);
+    stream=await getCamera(settings.audio);   // grab audio too, so recording can reuse this stream instantly
     preview.srcObject=stream; preview.muted=true; preview.playsInline=true; await preview.play().catch(()=>{});
     preview.style.display='block'; canvas.style.display='none';
     await waitForDims(preview);
@@ -505,9 +551,10 @@ function onScanned(text){
   stopScanEngine();
   currentOrder=text.trim();
   $('scannedNo').textContent=currentOrder;
+  beep();
   if(navigator.vibrate)navigator.vibrate(60);
   state='scanned';render();setStatus(`單號 <b>${currentOrder}</b> ✓`);
-  if(settings.autoRec){ setTimeout(startRecording,350); }
+  if(settings.autoRec){ setTimeout(startRecording,60); }
 }
 function manualEntry(){
   const v=prompt('輸入單號 / 訂單編號');
@@ -516,45 +563,68 @@ function manualEntry(){
 
 /* ---------- pick a recordable mime type (mp4 for iOS, webm for Android) ---------- */
 function pickMime(){
-  const cands=['video/mp4;codecs=avc1.42E01E,mp4a.40.2','video/mp4','video/webm;codecs=vp9,opus','video/webm;codecs=vp8,opus','video/webm'];
+  // order matters: prefer hardware-accelerated codecs. H.264 (mp4) first;
+  // then VP8 (widely HW-accelerated on Android); VP9 last (often SOFTWARE-encoded on
+  // budget phones → overheating over long clips).
+  const cands=[
+    'video/mp4;codecs=avc1.42E01E,mp4a.40.2',
+    'video/mp4;codecs=h264,aac',
+    'video/mp4',
+    'video/webm;codecs=vp8,opus',
+    'video/webm;codecs=vp8',
+    'video/webm;codecs=vp9,opus',
+    'video/webm'
+  ];
   for(const m of cands){ if(window.MediaRecorder&&MediaRecorder.isTypeSupported(m))return m; }
   return '';
 }
+function codecTag(mime){ mime=mime||''; if(/avc|h264|mp4/.test(mime))return 'H.264'; if(/vp9/.test(mime))return 'VP9'; if(/vp8/.test(mime))return 'VP8'; return mime.split(';')[0]||'?'; }
 function extFor(mime){return /mp4/.test(mime)?'mp4':'webm';}
 
 /* ---------- RECORD ---------- */
 async function startRecording(){
   try{
-    setStatus('啟動相機…');
-    stopStream();
-    stream=await getCamera(settings.audio);
+    // reuse the live scan stream if it's still open (fast hand-off); otherwise open the camera
+    const vt=stream&&stream.getVideoTracks&&stream.getVideoTracks()[0];
+    const live=vt&&vt.readyState==='live';
+    const audioOk=!settings.audio||(stream&&stream.getAudioTracks&&stream.getAudioTracks().length>0);
+    if(!(live&&audioOk)){
+      setStatus('啟動相機…');
+      stopStream();
+      stream=await getCamera(settings.audio);
+    }
     preview.srcObject=stream; preview.muted=true; await preview.play().catch(()=>{});
     await waitForDims(preview);
 
     const mime=pickMime();
-    let recordStream=stream;
+    const useWM = !!(settings.watermark && canvas.captureStream);
+    recordStream=stream;
 
-    // true camera resolution (cap to 1080p for smooth encoding), drives both canvas size and bitrate
+    // output resolution: raw path caps at 1080p; watermark path caps harder at 720p
+    // (the canvas pipeline is GPU-heavy, so a lower res keeps the phone cool over long clips)
     let vw=preview.videoWidth||1280, vh=preview.videoHeight||720;
-    const cap=1080;
+    const cap=useWM?720:1080;
     if(Math.min(vw,vh)>cap){ const r=cap/Math.min(vw,vh); vw=Math.round(vw*r); vh=Math.round(vh*r); }
-    const fps=30;
-    // ~0.12 bits/pixel/frame → roughly 9 Mbps at 1080p; clamp 4–12 Mbps
-    const vbps=Math.min(12000000,Math.max(4000000,Math.round(vw*vh*fps*0.12)));
+    const fps=24;
+    // high: ~0.12 bits/px/frame; standard: ~0.07 → clear at 1080p but light on the encoder
+    const factor=settings.hq?0.12:0.07;
+    const floor=settings.hq?3500000:2500000;
+    const ceil=settings.hq?10000000:6000000;
+    const vbps=Math.min(ceil,Math.max(floor,Math.round(vw*vh*fps*factor)));
     const recOpts={videoBitsPerSecond:vbps,audioBitsPerSecond:128000};
     if(mime)recOpts.mimeType=mime;
 
-    // burned-in watermark via canvas pipeline (guarded; falls back to raw)
-    if(settings.watermark && canvas.captureStream){
+    // burned-in watermark via canvas pipeline (guarded; falls back to raw camera stream)
+    if(useWM){
       try{
-        canvas.width=vw; canvas.height=vh;                 // match native res — no upscaling blur
+        canvas.width=vw; canvas.height=vh;
         canvas.style.display='block'; preview.style.display='none';
         drawLoop();
         const cs=canvas.captureStream(fps);
         stream.getAudioTracks().forEach(t=>cs.addTrack(t));
         recordStream=cs;
       }catch(err){ stopDraw(); canvas.style.display='none'; preview.style.display='block'; recordStream=stream; }
-    }else{ canvas.style.display='none'; preview.style.display='block'; }
+    }else{ canvas.style.display='none'; preview.style.display='block'; recordStream=stream; }
 
     chunks=[];
     try{ mediaRecorder=new MediaRecorder(recordStream,recOpts); }
@@ -575,11 +645,15 @@ async function startRecording(){
 function tick(){const s=Math.floor((Date.now()-recStart)/1000);$('recTime').textContent=`${pad(Math.floor(s/60))}:${pad(s%60)}`;}
 
 function drawLoop(){
-  const W=canvas.width,H=canvas.height;
-  const f=()=>{
+  const interval=1000/24;   // cap actual redraws at 24fps regardless of display refresh
+  let last=-1;
+  const f=(ts)=>{
+    drawRAF=requestAnimationFrame(f);
+    if(last>=0 && ts-last<interval) return;
+    last=ts;
+    const W=canvas.width,H=canvas.height;
     if(preview.readyState>=2){ ctx.drawImage(preview,0,0,W,H); }
-    // watermark band
-    const fs=Math.max(16,Math.round(W*0.026));
+    const fs=Math.max(16,Math.round(W*0.03));
     ctx.font=`700 ${fs}px monospace`;
     const t1=stamp(new Date());
     const t2='單號 '+currentOrder;
@@ -591,9 +665,8 @@ function drawLoop(){
     ctx.fillText(t2, pad2, H-bandH+pad2);
     ctx.fillStyle='#ffffff';
     ctx.fillText(t1, pad2, H-bandH+pad2+fs+pad2*0.6);
-    drawRAF=requestAnimationFrame(f);
   };
-  f();
+  drawRAF=requestAnimationFrame(f);
 }
 function stopDraw(){if(drawRAF)cancelAnimationFrame(drawRAF);drawRAF=null;}
 
@@ -604,17 +677,17 @@ function stopRecording(){
 
 let lastSavedId=null;
 async function finishRecording(mime){
-  stopDraw();
   const blob=new Blob(chunks,{type:mime});
   chunks=[];
-  stopStream();
+  releaseCamera();
+  preview.style.display='none'; canvas.style.display='none';
   const ext=extFor(mime);
   const filename=sanitize(currentOrder)+'.'+ext;
   const rec={id:'c_'+Date.now(),orderNo:currentOrder,filename,mime,size:blob.size,createdAt:Date.now(),blob,up:{g:'idle',d:'idle'}};
   lastSavedId=rec.id;
   try{ await dbPut(rec); }catch(e){ console.error(e); }
   state='done'; render();
-  setStatus(`已存檔 <b>${filename}</b>（${humanSize(blob.size)}）`);
+  setStatus(`已存檔 <b>${filename}</b>（${humanSize(blob.size)}·${codecTag(mime)}）`);
   if(navigator.vibrate)navigator.vibrate([40,60,40]);
   // fire uploads
   uploadRecord(rec.id);
@@ -660,9 +733,7 @@ function goIdleVisualOnly(){stopDraw();clearInterval(recTimer);}
 function goIdle(){
   goIdleVisualOnly();
   stopScanEngine();
-  if(mediaRecorder&&mediaRecorder.state!=='inactive'){try{mediaRecorder.stop();}catch(_){}}
-  mediaRecorder=null;
-  stopStream();
+  releaseCamera();
   canvas.style.display='none'; preview.style.display='none';
   currentOrder=''; state='idle'; render(); setStatus('就緒');
 }
@@ -771,15 +842,44 @@ async function dropboxToken(){
   tokens.dropboxAccess=j.access_token;tokens.dropboxExp=Date.now()+(j.expires_in||14000)*1000;saveTok();
   return j.access_token;
 }
+function dbxEsc(s){return s.replace(/[\u007f-\uffff]/g,c=>'\\u'+('0000'+c.charCodeAt(0).toString(16)).slice(-4));}
 async function dropboxUpload(rec){
   const tok=await dropboxToken();
   const folder=(settings.dFolder||'').trim();
   const path='/'+(folder?folder.replace(/^\/|\/$/g,'')+'/':'')+rec.filename;
-  const arg={path,mode:'add',autorename:true,mute:true};
-  // HTTP headers are ASCII-only; Dropbox requires non-ASCII escaped as \uXXXX
-  const argHeader=JSON.stringify(arg).replace(/[\u007f-\uffff]/g,c=>'\\u'+('0000'+c.charCodeAt(0).toString(16)).slice(-4));
-  const r=await fetch('https://content.dropboxapi.com/2/files/upload',{method:'POST',headers:{'Authorization':'Bearer '+tok,'Dropbox-API-Arg':argHeader,'Content-Type':'application/octet-stream'},body:rec.blob});
-  if(!r.ok){const t=await r.text();throw new Error('Dropbox '+r.status+'：'+t.slice(0,160));}
+  const blob=rec.blob, size=blob.size;
+  const SINGLE_LIMIT=140*1024*1024;   // Dropbox single-shot cap is 150MB; stay safely under
+
+  // small file → one request
+  if(size<=SINGLE_LIMIT){
+    const arg={path,mode:'add',autorename:true,mute:true};
+    const r=await fetch('https://content.dropboxapi.com/2/files/upload',{method:'POST',headers:{'Authorization':'Bearer '+tok,'Dropbox-API-Arg':dbxEsc(JSON.stringify(arg)),'Content-Type':'application/octet-stream'},body:blob});
+    if(!r.ok){const t=await r.text();throw new Error('Dropbox '+r.status+'：'+t.slice(0,160));}
+    return true;
+  }
+
+  // large file → chunked upload session
+  const CHUNK=16*1024*1024;
+  let offset=0, r, j;
+  // 1) start with first chunk
+  const first=blob.slice(0,Math.min(CHUNK,size));
+  r=await fetch('https://content.dropboxapi.com/2/files/upload_session/start',{method:'POST',headers:{'Authorization':'Bearer '+tok,'Dropbox-API-Arg':JSON.stringify({close:false}),'Content-Type':'application/octet-stream'},body:first});
+  if(!r.ok){const t=await r.text();throw new Error('Dropbox start '+r.status+'：'+t.slice(0,140));}
+  j=await r.json(); const sid=j.session_id; offset=first.size;
+  // 2) append the middle chunks
+  while(offset<size){
+    const end=Math.min(offset+CHUNK,size);
+    if(end>=size)break;   // leave the final chunk for finish
+    const chunk=blob.slice(offset,end);
+    r=await fetch('https://content.dropboxapi.com/2/files/upload_session/append_v2',{method:'POST',headers:{'Authorization':'Bearer '+tok,'Dropbox-API-Arg':JSON.stringify({cursor:{session_id:sid,offset},close:false}),'Content-Type':'application/octet-stream'},body:chunk});
+    if(!r.ok){const t=await r.text();throw new Error('Dropbox append '+r.status+'：'+t.slice(0,140));}
+    offset=end;
+  }
+  // 3) finish with the last chunk + commit
+  const last=blob.slice(offset,size);
+  const finishArg={cursor:{session_id:sid,offset},commit:{path,mode:'add',autorename:true,mute:true}};
+  r=await fetch('https://content.dropboxapi.com/2/files/upload_session/finish',{method:'POST',headers:{'Authorization':'Bearer '+tok,'Dropbox-API-Arg':dbxEsc(JSON.stringify(finishArg)),'Content-Type':'application/octet-stream'},body:last});
+  if(!r.ok){const t=await r.text();throw new Error('Dropbox finish '+r.status+'：'+t.slice(0,160));}
   return true;
 }
 
@@ -834,7 +934,7 @@ async function refreshHistory(){
     if(r.up&&r.up.d==='err'&&r.up.dmsg)errs.push('Dropbox：'+esc(r.up.dmsg));
     el.innerHTML=`
       <div class="head"><div class="no">${esc(r.orderNo)||'(無單號)'}</div></div>
-      <div class="meta">${stamp(new Date(r.createdAt))} · ${humanSize(r.size)} · ${esc(r.filename)}</div>
+      <div class="meta">${stamp(new Date(r.createdAt))} · ${humanSize(r.size)} · ${codecTag(r.mime)} · ${esc(r.filename)}</div>
       <div class="badges">
         ${settings.gEnabled?badge('Drive',r.up&&r.up.g):''}
         ${settings.dEnabled?badge('Dropbox',r.up&&r.up.d):''}
@@ -888,6 +988,8 @@ function openDrawer(){
   $('gClientId').value=settings.gClientId; $('gFolder').value=settings.gFolder;
   $('dAppKey').value=settings.dAppKey; $('dFolder').value=settings.dFolder;
   $('swWatermark').classList.toggle('on',settings.watermark);
+  $('swHQ').classList.toggle('on',settings.hq);
+  $('swBeep').classList.toggle('on',settings.beep);
   $('swAudio').classList.toggle('on',settings.audio);
   $('swAutoRec').classList.toggle('on',settings.autoRec);
   $('swG').classList.toggle('on',settings.gEnabled);
@@ -904,6 +1006,8 @@ $('openSettings').onclick=openDrawer;
 $('closeSettings').onclick=closeDrawer;
 $('scrim').onclick=closeDrawer;
 bindSwitch($('swWatermark'),'watermark');
+bindSwitch($('swHQ'),'hq');
+bindSwitch($('swBeep'),'beep');
 bindSwitch($('swAudio'),'audio');
 bindSwitch($('swAutoRec'),'autoRec');
 bindSwitch($('swG'),'gEnabled',refreshDots);
@@ -936,6 +1040,8 @@ function refreshDots(){
 window.addEventListener('load',()=>{ setTimeout(initGoogle,800); });
 (async function boot(){
   try{ await openDB(); }catch(e){ console.error(e); }
+  // ask the OS to keep this site's stored videos from being auto-evicted
+  try{ if(navigator.storage&&navigator.storage.persist){ await navigator.storage.persist(); } }catch(_){}
   await dropboxHandleRedirect();
   refreshDots();
   render();
