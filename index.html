@@ -40,7 +40,7 @@
   .dot i{width:7px;height:7px;border-radius:50%;background:var(--ink-dim);display:inline-block}
   .dot.on{color:var(--ink);border-color:var(--scan-deep)}
   .dot.on i{background:var(--scan);box-shadow:0 0 8px var(--scan)}
-  .gear{width:40px;height:40px;border-radius:10px;border:1px solid var(--line);display:flex;align-items:center;justify-content:center;font-size:18px;background:var(--panel-2)}
+  .gear{width:44px;height:44px;border-radius:11px;border:1px solid var(--line);display:flex;align-items:center;justify-content:center;font-size:20px;background:var(--panel-2);flex:none}
 
   /* ---- stage ---- */
   main{flex:1;position:relative;overflow:hidden;display:flex;flex-direction:column}
@@ -108,17 +108,19 @@
   /* video player overlay */
   .player{position:fixed;inset:0;z-index:55;background:#000;transform:translateY(100%);transition:transform .28s cubic-bezier(.2,.8,.2,1);display:flex;flex-direction:column;padding-top:env(safe-area-inset-top);padding-bottom:env(safe-area-inset-bottom)}
   .player.open{transform:translateY(0)}
-  .player-bar{display:flex;align-items:center;gap:10px;padding:12px 16px;border-bottom:1px solid var(--line);background:var(--panel)}
-  .player-title{flex:1;font-family:var(--mono);font-weight:800;font-size:15px;color:var(--scan);word-break:break-all}
-  .player-body{flex:1;display:flex;align-items:center;justify-content:center;overflow:hidden;background:#000}
+  .player-bar{display:flex;align-items:center;gap:10px;padding:8px 12px;border-bottom:1px solid var(--line);background:var(--panel);min-height:60px}
+  #closePlayer{display:flex;align-items:center;gap:7px;font-family:var(--sans);font-weight:800;font-size:16px;color:#0a0d06;background:var(--scan);border:none;border-radius:12px;padding:13px 18px;flex:none}
+  .player-title{flex:1;font-family:var(--mono);font-weight:800;font-size:14px;color:var(--scan);word-break:break-all;text-align:right}
+  .player-body{flex:1;min-height:0;display:flex;align-items:center;justify-content:center;overflow:hidden;background:#000}
   .player-body video{width:100%;height:100%;object-fit:contain;background:#000}
   .player-actions{display:flex;gap:10px;padding:12px 16px calc(12px + env(safe-area-inset-bottom));background:var(--panel);border-top:1px solid var(--line)}
-  .player-actions button{flex:1;font-family:var(--mono);font-weight:700;font-size:13px;padding:13px;border-radius:11px;border:1px solid var(--line);background:var(--panel-2);color:var(--ink)}
+  .player-actions button{flex:1;font-family:var(--sans);font-weight:800;font-size:15px;padding:16px;border-radius:12px;border:1px solid var(--line);background:var(--panel-2);color:var(--ink)}
+  .player-actions .done{background:var(--scan);color:#0a0d06;border-color:var(--scan)}
   .empty{text-align:center;color:var(--ink-dim);padding:48px 20px;font-size:14px;line-height:1.7}
 
   /* ---- settings drawer ---- */
   .scrim{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:40;display:none}
-  .drawer{position:fixed;inset:0;z-index:50;background:var(--bg);transform:translateY(100%);transition:transform .28s cubic-bezier(.2,.8,.2,1);display:flex;flex-direction:column}
+  .drawer{position:fixed;inset:0;z-index:50;background:var(--bg);transform:translateY(100%);transition:transform .28s cubic-bezier(.2,.8,.2,1);display:flex;flex-direction:column;padding-top:env(safe-area-inset-top)}
   .drawer.open{transform:translateY(0)}
   .drawer header{position:sticky;top:0}
   .drawer .body{flex:1;overflow:auto;padding:16px 16px 40px}
@@ -280,15 +282,15 @@
 <!-- video player -->
 <div class="player" id="player">
   <div class="player-bar">
+    <button id="closePlayer">✕ 關閉</button>
     <div class="player-title" id="playerTitle">—</div>
-    <button class="gear" id="closePlayer" aria-label="關閉">✕</button>
   </div>
   <div class="player-body">
-    <video id="playerVideo" controls playsinline webkit-playsinline></video>
+    <video id="playerVideo" controls playsinline webkit-playsinline disablepictureinpicture controlslist="nofullscreen nodownload"></video>
   </div>
   <div class="player-actions">
     <button id="playerShare">分享 / 下載</button>
-    <button id="playerClose2">完成</button>
+    <button id="playerClose2" class="done">完成</button>
   </div>
 </div>
 
@@ -979,6 +981,8 @@ $('stage').addEventListener('click',(e)=>{ if(state==='scanning'||state==='recor
 $('closePlayer').onclick=closePlayer;
 $('playerClose2').onclick=closePlayer;
 $('playerShare').onclick=()=>{ if(playerId)shareRecord(playerId); };
+// iOS: if the video tries to take over into native fullscreen (which hides our close button), keep it inline
+$('playerVideo').addEventListener('webkitbeginfullscreen',function(){ try{ this.webkitExitFullscreen&&this.webkitExitFullscreen(); }catch(_){} });
 
 /* ========================================================================
    SETTINGS WIRING
