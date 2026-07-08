@@ -348,6 +348,7 @@ let recStart=0,recTimer=null;
 let currentOrder='';
 let drawRAF=null;         // watermark canvas loop
 let recordStream=null;    // stream fed to MediaRecorder (may be the canvas stream)
+let audioStream=null;     // separate mic stream (kept apart from the camera)
 
 const preview=$('preview'), canvas=$('canvas'), ctx=canvas.getContext('2d');
 
@@ -405,12 +406,23 @@ function stopStream(){
   if(stream){ try{stream.getTracks().forEach(t=>t.stop());}catch(_){} stream=null; }
   try{ preview.srcObject=null; }catch(_){}
 }
+/* build a raw record stream = camera video (+ mic audio if available) */
+function combineRaw(vStream,aTrack){
+  if(!aTrack)return vStream;
+  try{
+    const ms=new MediaStream();
+    vStream.getVideoTracks().forEach(t=>ms.addTrack(t));
+    ms.addTrack(aTrack);
+    return ms;
+  }catch(_){ return vStream; }
+}
 /* fully release the camera + recording pipeline — prevents the camera being left locked */
 function releaseCamera(){
   stopDraw();
   if(mediaRecorder && mediaRecorder.state!=='inactive'){ try{mediaRecorder.stop();}catch(_){} }
   if(recordStream && recordStream!==stream){ try{recordStream.getTracks().forEach(t=>t.stop());}catch(_){} }
   recordStream=null;
+  if(audioStream){ try{audioStream.getTracks().forEach(t=>t.stop());}catch(_){} audioStream=null; }
   stopStream();
   mediaRecorder=null;
 }
@@ -493,7 +505,7 @@ async function startScan(){
     initAudio();                       // unlock sound within this user tap (needed on iOS)
     state='scanning'; render(); setStatus('把條碼 / QR Code 對準框內…');
     stopStream();
-    stream=await getCamera(settings.audio);   // grab audio too, so recording can reuse this stream instantly
+    stream=await getCamera(false);   // VIDEO ONLY — never block scanning on mic permission
     preview.srcObject=stream; preview.muted=true; preview.playsInline=true; await preview.play().catch(()=>{});
     preview.style.display='block'; canvas.style.display='none';
     await waitForDims(preview);
@@ -586,24 +598,32 @@ function extFor(mime){return /mp4/.test(mime)?'mp4':'webm';}
 /* ---------- RECORD ---------- */
 async function startRecording(){
   try{
-    // reuse the live scan stream if it's still open (fast hand-off); otherwise open the camera
+    // reuse the live scan camera if possible (fast hand-off); otherwise open it (video only)
     const vt=stream&&stream.getVideoTracks&&stream.getVideoTracks()[0];
-    const live=vt&&vt.readyState==='live';
-    const audioOk=!settings.audio||(stream&&stream.getAudioTracks&&stream.getAudioTracks().length>0);
-    if(!(live&&audioOk)){
+    if(!(vt&&vt.readyState==='live')){
       setStatus('啟動相機…');
       stopStream();
-      stream=await getCamera(settings.audio);
+      stream=await getCamera(false);
     }
     preview.srcObject=stream; preview.muted=true; await preview.play().catch(()=>{});
     await waitForDims(preview);
+
+    // grab the mic separately — this never blocks the camera, and if it fails we just record silently
+    let audioTrack=null;
+    if(settings.audio){
+      try{
+        if(!(audioStream&&audioStream.getAudioTracks().length&&audioStream.getAudioTracks()[0].readyState==='live')){
+          audioStream=await navigator.mediaDevices.getUserMedia({audio:true});
+        }
+        audioTrack=audioStream.getAudioTracks()[0]||null;
+      }catch(_){ audioTrack=null; }
+    }
 
     const mime=pickMime();
     const useWM = !!(settings.watermark && canvas.captureStream);
     recordStream=stream;
 
     // output resolution: raw path caps at 1080p; watermark path caps harder at 720p
-    // (the canvas pipeline is GPU-heavy, so a lower res keeps the phone cool over long clips)
     let vw=preview.videoWidth||1280, vh=preview.videoHeight||720;
     const cap=useWM?720:1080;
     if(Math.min(vw,vh)>cap){ const r=cap/Math.min(vw,vh); vw=Math.round(vw*r); vh=Math.round(vh*r); }
@@ -623,10 +643,10 @@ async function startRecording(){
         canvas.style.display='block'; preview.style.display='none';
         drawLoop();
         const cs=canvas.captureStream(fps);
-        stream.getAudioTracks().forEach(t=>cs.addTrack(t));
+        if(audioTrack)cs.addTrack(audioTrack);
         recordStream=cs;
-      }catch(err){ stopDraw(); canvas.style.display='none'; preview.style.display='block'; recordStream=stream; }
-    }else{ canvas.style.display='none'; preview.style.display='block'; recordStream=stream; }
+      }catch(err){ stopDraw(); canvas.style.display='none'; preview.style.display='block'; recordStream=combineRaw(stream,audioTrack); }
+    }else{ canvas.style.display='none'; preview.style.display='block'; recordStream=combineRaw(stream,audioTrack); }
 
     chunks=[];
     try{ mediaRecorder=new MediaRecorder(recordStream,recOpts); }
