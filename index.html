@@ -3,7 +3,8 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, maximum-scale=1.0, user-scalable=no" />
-<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-capable" content="no" />
+<meta name="mobile-web-app-capable" content="no" />
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
 <meta name="apple-mobile-web-app-title" content="包貨錄影" />
 <meta name="theme-color" content="#0c0f14" />
@@ -111,8 +112,11 @@
   .player-bar{display:flex;align-items:center;gap:10px;padding:8px 12px;border-bottom:1px solid var(--line);background:var(--panel);min-height:60px}
   #closePlayer{display:flex;align-items:center;gap:7px;font-family:var(--sans);font-weight:800;font-size:16px;color:#0a0d06;background:var(--scan);border:none;border-radius:12px;padding:13px 18px;flex:none}
   .player-title{flex:1;font-family:var(--mono);font-weight:800;font-size:14px;color:var(--scan);word-break:break-all;text-align:right}
-  .player-body{flex:1;min-height:0;display:flex;align-items:center;justify-content:center;overflow:hidden;background:#000}
+  .player-body{flex:1;min-height:0;position:relative;display:flex;align-items:center;justify-content:center;overflow:hidden;background:#000}
   .player-body video{width:100%;height:100%;object-fit:contain;background:#000}
+  .big-play{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:82px;height:82px;border-radius:50%;background:rgba(0,0,0,.55);border:2px solid var(--scan);color:var(--scan);font-size:32px;display:flex;align-items:center;justify-content:center;z-index:5;padding-left:5px}
+  .player-seek{display:flex;align-items:center;gap:12px;padding:12px 16px;background:var(--panel);border-top:1px solid var(--line);font-family:var(--mono);font-size:12px;color:var(--ink-dim)}
+  .player-seek input[type=range]{flex:1;accent-color:var(--scan);height:28px}
   .player-actions{display:flex;gap:10px;padding:12px 16px calc(12px + env(safe-area-inset-bottom));background:var(--panel);border-top:1px solid var(--line)}
   .player-actions button{flex:1;font-family:var(--sans);font-weight:800;font-size:15px;padding:16px;border-radius:12px;border:1px solid var(--line);background:var(--panel-2);color:var(--ink)}
   .player-actions .done{background:var(--scan);color:#0a0d06;border-color:var(--scan)}
@@ -285,8 +289,14 @@
     <button id="closePlayer">✕ 關閉</button>
     <div class="player-title" id="playerTitle">—</div>
   </div>
-  <div class="player-body">
-    <video id="playerVideo" controls playsinline webkit-playsinline disablepictureinpicture controlslist="nofullscreen nodownload"></video>
+  <div class="player-body" id="playerBody">
+    <video id="playerVideo" playsinline webkit-playsinline disablepictureinpicture></video>
+    <button class="big-play hidden" id="bigPlay">▶</button>
+  </div>
+  <div class="player-seek">
+    <span id="curTime">0:00</span>
+    <input type="range" id="seekBar" min="0" max="1000" value="0" step="1">
+    <span id="durTime">0:00</span>
   </div>
   <div class="player-actions">
     <button id="playerShare">分享 / 下載</button>
@@ -384,23 +394,12 @@ function render(){
 
 /* ---------- camera ---------- */
 async function getCamera(withAudio){
-  const video={facingMode:{ideal:'environment'},width:{ideal:1920},height:{ideal:1080},frameRate:{ideal:30}};
-  let s;
-  try{ s=await navigator.mediaDevices.getUserMedia({video,audio:!!withAudio}); }
-  catch(e){ // looser fallback if the device can't meet the ideals
-    s=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'}},audio:!!withAudio});
-  }
-  // close-up packing needs active focus — turn on continuous AF / AE / AWB where supported
+  // keep this MINIMAL — advanced constraints (focus/exposure/frameRate) can black out iOS Safari
   try{
-    const track=s.getVideoTracks()[0];
-    const caps=track.getCapabilities?track.getCapabilities():{};
-    const adv=[];
-    if(caps.focusMode&&caps.focusMode.includes('continuous'))adv.push({focusMode:'continuous'});
-    if(caps.exposureMode&&caps.exposureMode.includes('continuous'))adv.push({exposureMode:'continuous'});
-    if(caps.whiteBalanceMode&&caps.whiteBalanceMode.includes('continuous'))adv.push({whiteBalanceMode:'continuous'});
-    if(adv.length)await track.applyConstraints({advanced:adv});
-  }catch(_){}
-  return s;
+    return await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'},width:{ideal:1920},height:{ideal:1080}},audio:!!withAudio});
+  }catch(e){
+    return await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'},audio:!!withAudio});
+  }
 }
 function stopStream(){
   if(stream){ try{stream.getTracks().forEach(t=>t.stop());}catch(_){} stream=null; }
@@ -505,13 +504,11 @@ async function startScan(){
     initAudio();                       // unlock sound within this user tap (needed on iOS)
     state='scanning'; render(); setStatus('把條碼 / QR Code 對準框內…');
     stopStream();
-    stream=await getCamera(false);   // VIDEO ONLY — never block scanning on mic permission
-    preview.srcObject=stream; preview.muted=true; preview.playsInline=true; await preview.play().catch(()=>{});
+    stream=await getCamera(false);     // VIDEO ONLY — never block scanning on mic permission
     preview.style.display='block'; canvas.style.display='none';
-    await waitForDims(preview);
     torchOn=false; scanBusy=false; detector=null; legacyZxing=false;
 
-    // prefer native detector, but only with formats it actually supports
+    // prefer native detector (Android), but only with formats it actually supports
     if('BarcodeDetector' in window){
       try{
         let supported=BD_FORMATS;
@@ -524,11 +521,15 @@ async function startScan(){
     }
 
     if(detector){
+      // we drive the preview + detect ourselves
+      preview.srcObject=stream; preview.muted=true; preview.setAttribute('playsinline',''); preview.setAttribute('webkit-playsinline','');
+      await preview.play().catch(()=>{});
       scanLoop();
     }else{
-      if(typeof ZXing==='undefined'){toast('條碼元件載入中，請稍候再試');return;}
+      if(typeof ZXing==='undefined'){ toast('條碼元件載入中，請稍候再試'); setStatus('條碼元件載入中，請再按一次'); return; }
       ensureZXing();
       legacyZxing=true;
+      // let ZXing attach the stream to the <video> and play it — avoids the iOS double-attach black screen
       zxingReader.decodeFromStream(stream,preview,(res)=>{ if(res)onScanned(res.getText()); });
     }
     render();
@@ -738,9 +739,12 @@ async function openPlayer(id){
   const v=$('playerVideo');
   v.src=playerURL;
   $('playerTitle').textContent=rec.orderNo||rec.filename;
+  $('seekBar').value=0; $('curTime').textContent='0:00'; $('durTime').textContent='0:00';
   $('player').classList.add('open');
   try{ await v.play(); }catch(_){ /* user can tap play */ }
 }
+function fmtT(s){ s=Math.max(0,Math.floor(s||0)); return Math.floor(s/60)+':'+String(s%60).padStart(2,'0'); }
+function playerToggle(){ const v=$('playerVideo'); if(!v.src)return; if(v.paused)v.play().catch(()=>{}); else v.pause(); }
 function closePlayer(){
   const v=$('playerVideo');
   try{ v.pause(); }catch(_){}
@@ -762,11 +766,16 @@ function goIdle(){
 function stopAll(){ goIdle(); }
 function handleCamError(e){
   console.error(e);
+  const name=(e&&e.name)||'';
   let m='無法開啟相機';
-  if(e&&e.name==='NotAllowedError')m='相機權限被拒。請到瀏覽器設定允許相機（與麥克風）。';
-  else if(e&&e.name==='NotFoundError')m='找不到相機裝置。';
-  else if(location.protocol!=='https:'&&location.hostname!=='localhost')m='需要 HTTPS 才能使用相機。請把本頁放到 https 網址。';
-  toast(m); setStatus(m); state='idle'; render();
+  if(name==='NotAllowedError')m='相機權限被拒。請到 Safari 設定 → 這個網站 → 允許相機，再重試。';
+  else if(name==='NotFoundError')m='找不到相機裝置。';
+  else if(name==='NotReadableError'||name==='AbortError')m='相機被其他程式佔用。請關掉其他相機 App（或重開機）後再試。';
+  else if(location.protocol!=='https:'&&location.hostname!=='localhost')m='需要 HTTPS 才能使用相機。請用 https 網址開啟。';
+  else if(name)m='相機錯誤：'+name;
+  toast(m); setStatus(m);
+  const hint=$('idleHint'); if(hint){ hint.innerHTML='<p class="big">相機無法開啟</p><p>'+m+'</p>'; }
+  state='idle'; render();
 }
 
 /* ========================================================================
@@ -1001,8 +1010,17 @@ $('stage').addEventListener('click',(e)=>{ if(state==='scanning'||state==='recor
 $('closePlayer').onclick=closePlayer;
 $('playerClose2').onclick=closePlayer;
 $('playerShare').onclick=()=>{ if(playerId)shareRecord(playerId); };
-// iOS: if the video tries to take over into native fullscreen (which hides our close button), keep it inline
-$('playerVideo').addEventListener('webkitbeginfullscreen',function(){ try{ this.webkitExitFullscreen&&this.webkitExitFullscreen(); }catch(_){} });
+(function wirePlayer(){
+  const pv=$('playerVideo'), bp=$('bigPlay'), sb=$('seekBar');
+  $('playerBody').addEventListener('click',(e)=>{ if(e.target===bp)return; playerToggle(); });
+  bp.onclick=playerToggle;
+  pv.addEventListener('play',()=>show(bp,false));
+  pv.addEventListener('pause',()=>show(bp,true));
+  pv.addEventListener('ended',()=>show(bp,true));
+  pv.addEventListener('loadedmetadata',()=>{ if(isFinite(pv.duration))$('durTime').textContent=fmtT(pv.duration); });
+  pv.addEventListener('timeupdate',()=>{ if(pv.duration){ sb.value=Math.round(pv.currentTime/pv.duration*1000); $('curTime').textContent=fmtT(pv.currentTime); } });
+  sb.addEventListener('input',()=>{ if(pv.duration){ pv.currentTime=sb.value/1000*pv.duration; } });
+})();
 
 /* ========================================================================
    SETTINGS WIRING
