@@ -464,8 +464,10 @@ function ensureZXing(){
     // TRY_HARDER greatly improves 1D (Code128/EAN/UPC/ITF) reads on the iOS software path
     hints.set(H.POSSIBLE_FORMATS,[F.QR_CODE,F.CODE_128,F.CODE_39,F.CODE_93,F.EAN_13,F.EAN_8,F.UPC_A,F.UPC_E,F.ITF,F.CODABAR]);
     hints.set(H.TRY_HARDER,true);
-    zxingReader=new ZXing.BrowserMultiFormatReader(hints);
-  }catch(e){ zxingReader=new ZXing.BrowserMultiFormatReader(); }
+    // default is 500ms between attempts (only ~2 tries/sec) → make it ~10 tries/sec
+    zxingReader=new ZXing.BrowserMultiFormatReader(hints,{delayBetweenScanAttempts:100});
+  }catch(e){ try{ zxingReader=new ZXing.BrowserMultiFormatReader(); }catch(_){} }
+  try{ zxingReader.timeBetweenScansMillis=100; }catch(_){}
   return zxingReader;
 }
 function stopScanEngine(){
