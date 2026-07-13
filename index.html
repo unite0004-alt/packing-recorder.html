@@ -459,7 +459,13 @@ let detector=null, zxingReader=null, legacyZxing=false, scanRAF=null, scanBusy=f
 
 function ensureZXing(){
   if(zxingReader)return zxingReader;
-  zxingReader=new ZXing.BrowserMultiFormatReader();   // all formats incl. QR — matches the known-good path
+  try{
+    const F=ZXing.BarcodeFormat, H=ZXing.DecodeHintType, hints=new Map();
+    // TRY_HARDER greatly improves 1D (Code128/EAN/UPC/ITF) reads on the iOS software path
+    hints.set(H.POSSIBLE_FORMATS,[F.QR_CODE,F.CODE_128,F.CODE_39,F.CODE_93,F.EAN_13,F.EAN_8,F.UPC_A,F.UPC_E,F.ITF,F.CODABAR]);
+    hints.set(H.TRY_HARDER,true);
+    zxingReader=new ZXing.BrowserMultiFormatReader(hints);
+  }catch(e){ zxingReader=new ZXing.BrowserMultiFormatReader(); }
   return zxingReader;
 }
 function stopScanEngine(){
