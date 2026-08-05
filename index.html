@@ -94,6 +94,12 @@
   #historyView{display:none;flex:1;overflow:auto;background:var(--bg);padding:12px 14px}
   .rec-item{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px 14px;margin-bottom:10px}
   .rec-item .head{display:flex;align-items:center;gap:10px}
+  .batch-bar{display:flex;align-items:center;gap:10px;background:#2a2410;border:1px solid #5e4a1c;border-radius:12px;padding:12px 14px;margin-bottom:12px}
+  .batch-bar.ok{background:#13241c;border-color:#1f5e44}
+  .batch-txt{flex:1;font-family:var(--mono);font-size:13px;font-weight:700;color:var(--warn)}
+  .batch-bar.ok .batch-txt{color:var(--ok)}
+  .batch-txt b{color:var(--ink)}
+  #batchRetry{font-family:var(--sans);font-weight:800;font-size:13px;padding:11px 14px;border-radius:10px;border:none;background:var(--scan);color:#0a0d06;flex:none}
   .rec-item .no{font-family:var(--mono);font-weight:800;font-size:15px;flex:1;word-break:break-all}
   .rec-item .meta{font-family:var(--mono);font-size:11px;color:var(--ink-dim);margin-top:4px}
   .badges{display:flex;gap:6px;margin-top:9px;flex-wrap:wrap}
@@ -234,6 +240,8 @@
 
     <div class="sect" style="margin-top:24px">雲端上傳</div>
 
+    <div class="toggle"><div><div class="t-txt">自動檢查並補傳</div><div class="t-sub">每分鐘自動檢查，發現沒傳成功的就自動重新上傳</div></div><div class="sw on" id="swAutoRetry"></div></div>
+
     <div class="field">
       <label>Google Drive</label>
       <p class="hint">貼上你自己的 OAuth Client ID，影片只會傳到你的 Google Drive。下方有設定教學。</p>
@@ -332,7 +340,7 @@ function humanSize(b){if(!b) return '—';const u=['B','KB','MB','GB'];let i=0;w
 
 /* ---------- settings (localStorage) ---------- */
 const SET_KEY='packrec.settings.v1';
-const defaults={watermark:true,audio:true,autoRec:false,hq:false,beep:true,gClientId:'',gFolder:'出貨錄影',gEnabled:false,dAppKey:'',dFolder:'出貨錄影',dEnabled:false};
+const defaults={watermark:true,audio:true,autoRec:false,hq:false,beep:true,autoRetry:true,gClientId:'',gFolder:'出貨錄影',gEnabled:false,dAppKey:'',dFolder:'出貨錄影',dEnabled:false};
 let settings=Object.assign({},defaults,JSON.parse(localStorage.getItem(SET_KEY)||'{}'));
 function saveSet(){localStorage.setItem(SET_KEY,JSON.stringify(settings));}
 
@@ -722,8 +730,10 @@ async function finishRecording(mime){
   releaseCamera();
   preview.style.display='none'; canvas.style.display='none';
   const ext=extFor(mime);
-  const filename=sanitize(currentOrder)+'.'+ext;
-  const rec={id:'c_'+Date.now(),orderNo:currentOrder,filename,mime,size:blob.size,createdAt:Date.now(),blob,up:{g:'idle',d:'idle'}};
+  const now=new Date();
+  const dt=`${now.getFullYear()}-${pad(now.getMonth()+1)}-${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}`;
+  const filename=sanitize(currentOrder)+'_'+dt+'.'+ext;
+  const rec={id:'c_'+Date.now(),orderNo:currentOrder,filename,mime,size:blob.size,createdAt:now.getTime(),blob,up:{g:'idle',d:'idle'}};
   lastSavedId=rec.id;
   try{ await dbPut(rec); }catch(e){ console.error(e); }
   state='done'; render();
@@ -937,16 +947,16 @@ async function dropboxUpload(rec){
 async function uploadRecord(id){
   const rec=await dbGet(id); if(!rec)return;
   const jobs=[];
-  if(settings.gEnabled&&settings.gClientId){ jobs.push(runUpload(rec,'g')); }
-  if(settings.dEnabled&&tokens.dropboxRefresh){ jobs.push(runUpload(rec,'d')); }
-  if(!jobs.length){ setStatus(`已存檔 <b>${rec.filename}</b>（僅本機，未設定雲端）`); refreshHistory(); return; }
+  // only (re)upload clouds that haven't already succeeded — avoids duplicate files on retry
+  if(settings.gEnabled&&settings.gClientId&&rec.up.g!=='done'){ jobs.push(runUpload(rec,'g')); }
+  if(settings.dEnabled&&tokens.dropboxRefresh&&rec.up.d!=='done'){ jobs.push(runUpload(rec,'d')); }
+  if(!jobs.length){ if(!(settings.gEnabled||settings.dEnabled))setStatus(`已存檔 <b>${rec.filename}</b>（僅本機，未設定雲端）`); refreshHistory(); return; }
   setStatus('上傳中…');
   await Promise.allSettled(jobs);
   const r2=await dbGet(id);
-  const okG=r2.up.g==='done', okD=r2.up.d==='done';
   const parts=[];
-  if(settings.gEnabled)parts.push('Drive '+(okG?'✓':'✗'));
-  if(settings.dEnabled)parts.push('Dropbox '+(okD?'✓':'✗'));
+  if(settings.gEnabled)parts.push('Drive '+(r2.up.g==='done'?'✓':'✗'));
+  if(settings.dEnabled)parts.push('Dropbox '+(r2.up.d==='done'?'✓':'✗'));
   setStatus(parts.join('　')||'已存檔');
   refreshHistory();
 }
@@ -956,13 +966,40 @@ async function runUpload(rec,which){
   try{
     if(which==='g'){ const tok=await gToken(false); await gUpload(fresh,tok); }
     else{ await dropboxUpload(fresh); }
-    const f2=await dbGet(rec.id); f2.up[which]='done'; await dbPut(f2);
+    const f2=await dbGet(rec.id); f2.up[which]='done'; f2.up[which+'msg']=''; await dbPut(f2);
   }catch(e){
     console.error(which,e);
     const f2=await dbGet(rec.id); if(f2){f2.up[which]='err'; f2.up[which+'msg']=String(e.message||e); await dbPut(f2);}
   }
   refreshHistory();
 }
+
+/* ---------- pending detection + batch / auto retry ---------- */
+function cloudPending(r){
+  if(!r||!r.up)return false;
+  if(settings.gEnabled&&settings.gClientId&&r.up.g!=='done')return true;
+  if(settings.dEnabled&&tokens.dropboxRefresh&&r.up.d!=='done')return true;
+  return false;
+}
+let retryRunning=false;
+async function uploadPending(list,opts){
+  opts=opts||{};
+  if(retryRunning){ if(opts.announce)toast('上傳處理進行中…'); return; }
+  if(!list.length){ if(opts.announce)toast('沒有待補傳的項目'); return; }
+  retryRunning=true;
+  if(opts.announce)toast(`開始補傳 ${list.length} 筆…`);
+  try{ for(const r of list){ await uploadRecord(r.id); } }
+  finally{ retryRunning=false; refreshHistory(); if(opts.announce)toast('補傳處理完成'); }
+}
+async function retryAllPending(){ const all=await dbAll(); await uploadPending(all.filter(cloudPending),{announce:true}); }
+async function autoRetryTick(){
+  if(!settings.autoRetry||retryRunning||!navigator.onLine)return;
+  if(!(settings.gEnabled||settings.dEnabled))return;
+  const all=await dbAll();
+  await uploadPending(all.filter(cloudPending),{announce:false});
+}
+let autoRetryTimer=null;
+function startAutoRetry(){ if(autoRetryTimer)clearInterval(autoRetryTimer); autoRetryTimer=setInterval(autoRetryTick,60000); }
 
 /* ========================================================================
    HISTORY VIEW
@@ -974,6 +1011,19 @@ async function refreshHistory(){
   if(!all.length){ wrap.innerHTML='<div class="empty">還沒有出貨紀錄。<br>回到「錄影」分頁，掃描第一筆單號吧。</div>'; return; }
   wrap.innerHTML='';
   const esc=s=>String(s||'').replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));
+  // batch bar: how many still need uploading
+  const pendCount=all.filter(cloudPending).length;
+  if(settings.gEnabled||settings.dEnabled){
+    const bar=document.createElement('div'); bar.className='batch-bar';
+    if(pendCount>0){
+      bar.innerHTML=`<div class="batch-txt">尚有 <b>${pendCount}</b> 筆未成功上傳</div><button id="batchRetry">↻ 全部重新上傳</button>`;
+    }else{
+      bar.className='batch-bar ok';
+      bar.innerHTML=`<div class="batch-txt">✓ 全部已上傳雲端</div>`;
+    }
+    wrap.appendChild(bar);
+    const br=bar.querySelector('#batchRetry'); if(br)br.onclick=()=>retryAllPending();
+  }
   for(const r of all){
     const el=document.createElement('div');el.className='rec-item';
     const badge=(label,st)=>{const cls=st==='done'?'ok':st==='err'?'err':st==='up'?'up':'';const ic=st==='done'?'✓':st==='err'?'✗':st==='up'?'⟳':'·';return `<span class="badge ${cls}">${label} ${ic}</span>`;};
@@ -1049,6 +1099,7 @@ function openDrawer(){
   $('swWatermark').classList.toggle('on',settings.watermark);
   $('swHQ').classList.toggle('on',settings.hq);
   $('swBeep').classList.toggle('on',settings.beep);
+  $('swAutoRetry').classList.toggle('on',settings.autoRetry);
   $('swAudio').classList.toggle('on',settings.audio);
   $('swAutoRec').classList.toggle('on',settings.autoRec);
   $('swG').classList.toggle('on',settings.gEnabled);
@@ -1067,6 +1118,7 @@ $('scrim').onclick=closeDrawer;
 bindSwitch($('swWatermark'),'watermark');
 bindSwitch($('swHQ'),'hq');
 bindSwitch($('swBeep'),'beep');
+bindSwitch($('swAutoRetry'),'autoRetry',()=>{ if(settings.autoRetry)autoRetryTick(); });
 bindSwitch($('swAudio'),'audio');
 bindSwitch($('swAutoRec'),'autoRec');
 bindSwitch($('swG'),'gEnabled',refreshDots);
@@ -1113,6 +1165,8 @@ window.addEventListener('load',()=>{ setTimeout(initGoogle,800); });
   refreshDots();
   render();
   setStatus('就緒');
+  startAutoRetry();
+  window.addEventListener('online', autoRetryTick);
   if(location.protocol!=='https:'&&location.hostname!=='localhost'){
     setStatus('⚠ 需要 HTTPS 才能用相機與上傳');
   }
