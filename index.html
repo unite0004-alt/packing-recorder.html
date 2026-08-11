@@ -269,7 +269,7 @@
       <input type="text" id="dAppKey" placeholder="Dropbox App key" autocomplete="off" autocapitalize="off" spellcheck="false">
       <div class="toggle" style="margin-top:10px"><div><div class="t-txt">開啟自動上傳到 Dropbox</div></div><div class="sw" id="swD"></div></div>
       <div class="field" style="margin:8px 0 0"><input type="text" id="dFolder" placeholder="Dropbox 資料夾名稱（例：出貨錄影）" autocomplete="off"></div>
-      <div class="connect-row"><button id="btnConnectD">連結 Dropbox</button></div>
+      <div class="connect-row"><button id="btnConnectD">連結 Dropbox</button><button id="btnTestD">測試上傳</button></div>
     </div>
 
     <details class="guide">
@@ -894,49 +894,58 @@ async function dropboxToken(){
   if(tokens.dropboxAccess&&Date.now()<tokens.dropboxExp-30000)return tokens.dropboxAccess;
   if(!tokens.dropboxRefresh)throw new Error('Dropbox 未連結');
   const body=new URLSearchParams({grant_type:'refresh_token',refresh_token:tokens.dropboxRefresh,client_id:settings.dAppKey});
-  const r=await fetch('https://api.dropboxapi.com/oauth2/token',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});
-  const j=await r.json();
-  if(!j.access_token)throw new Error('Dropbox 換 token 失敗');
+  let r;
+  try{ r=await fetchRetry('https://api.dropboxapi.com/oauth2/token',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body}); }
+  catch(e){ throw new Error('連不上 Dropbox（網路問題），請檢查網路'); }
+  const j=await r.json().catch(()=>({}));
+  if(!j.access_token)throw new Error('Dropbox 授權失效，請到設定重新連結 Dropbox');
   tokens.dropboxAccess=j.access_token;tokens.dropboxExp=Date.now()+(j.expires_in||14000)*1000;saveTok();
   return j.access_token;
 }
 function dbxEsc(s){return s.replace(/[\u007f-\uffff]/g,c=>'\\u'+('0000'+c.charCodeAt(0).toString(16)).slice(-4));}
+/* retry a fetch a few times on network-level failures (iOS Safari "Load failed") */
+async function fetchRetry(url,opts,tries){
+  tries=tries||4; let lastErr;
+  for(let i=0;i<tries;i++){
+    try{ return await fetch(url,opts); }
+    catch(e){ lastErr=e; await new Promise(r=>setTimeout(r,600*(i+1))); }
+  }
+  throw lastErr;
+}
 async function dropboxUpload(rec){
   const tok=await dropboxToken();
   const folder=(settings.dFolder||'').trim();
   const path='/'+(folder?folder.replace(/^\/|\/$/g,'')+'/':'')+rec.filename;
   const blob=rec.blob, size=blob.size;
-  const SINGLE_LIMIT=140*1024*1024;   // Dropbox single-shot cap is 150MB; stay safely under
+  const SINGLE_LIMIT=140*1024*1024;
+  const post=(url,arg,body)=>fetchRetry(url,{method:'POST',headers:{'Authorization':'Bearer '+tok,'Dropbox-API-Arg':dbxEsc(JSON.stringify(arg)),'Content-Type':'application/octet-stream'},body});
 
-  // small file → one request
+  // small file → one request (with retry)
   if(size<=SINGLE_LIMIT){
-    const arg={path,mode:'add',autorename:true,mute:true};
-    const r=await fetch('https://content.dropboxapi.com/2/files/upload',{method:'POST',headers:{'Authorization':'Bearer '+tok,'Dropbox-API-Arg':dbxEsc(JSON.stringify(arg)),'Content-Type':'application/octet-stream'},body:blob});
+    const r=await post('https://content.dropboxapi.com/2/files/upload',{path,mode:'add',autorename:true,mute:true},blob);
     if(!r.ok){const t=await r.text();throw new Error('Dropbox '+r.status+'：'+t.slice(0,160));}
     return true;
   }
 
-  // large file → chunked upload session
-  const CHUNK=16*1024*1024;
-  let offset=0, r, j;
-  // 1) start with first chunk
-  const first=blob.slice(0,Math.min(CHUNK,size));
-  r=await fetch('https://content.dropboxapi.com/2/files/upload_session/start',{method:'POST',headers:{'Authorization':'Bearer '+tok,'Dropbox-API-Arg':JSON.stringify({close:false}),'Content-Type':'application/octet-stream'},body:first});
+  // large file → chunked upload session; smaller chunks survive flaky mobile networks better
+  const CHUNK=8*1024*1024;
+  let r=await post('https://content.dropboxapi.com/2/files/upload_session/start',{close:false},blob.slice(0,Math.min(CHUNK,size)));
   if(!r.ok){const t=await r.text();throw new Error('Dropbox start '+r.status+'：'+t.slice(0,140));}
-  j=await r.json(); const sid=j.session_id; offset=first.size;
-  // 2) append the middle chunks
+  const sid=(await r.json()).session_id;
+  let offset=Math.min(CHUNK,size);
   while(offset<size){
     const end=Math.min(offset+CHUNK,size);
-    if(end>=size)break;   // leave the final chunk for finish
-    const chunk=blob.slice(offset,end);
-    r=await fetch('https://content.dropboxapi.com/2/files/upload_session/append_v2',{method:'POST',headers:{'Authorization':'Bearer '+tok,'Dropbox-API-Arg':JSON.stringify({cursor:{session_id:sid,offset},close:false}),'Content-Type':'application/octet-stream'},body:chunk});
-    if(!r.ok){const t=await r.text();throw new Error('Dropbox append '+r.status+'：'+t.slice(0,140));}
+    if(end>=size)break;   // final chunk goes to finish
+    r=await post('https://content.dropboxapi.com/2/files/upload_session/append_v2',{cursor:{session_id:sid,offset},close:false},blob.slice(offset,end));
+    if(!r.ok){
+      const t=await r.text();
+      const m=t.match(/"correct_offset":\s*(\d+)/);   // resume from Dropbox's expected offset if we drifted
+      if(m){ offset=parseInt(m[1],10); continue; }
+      throw new Error('Dropbox append '+r.status+'：'+t.slice(0,140));
+    }
     offset=end;
   }
-  // 3) finish with the last chunk + commit
-  const last=blob.slice(offset,size);
-  const finishArg={cursor:{session_id:sid,offset},commit:{path,mode:'add',autorename:true,mute:true}};
-  r=await fetch('https://content.dropboxapi.com/2/files/upload_session/finish',{method:'POST',headers:{'Authorization':'Bearer '+tok,'Dropbox-API-Arg':dbxEsc(JSON.stringify(finishArg)),'Content-Type':'application/octet-stream'},body:last});
+  r=await post('https://content.dropboxapi.com/2/files/upload_session/finish',{cursor:{session_id:sid,offset},commit:{path,mode:'add',autorename:true,mute:true}},blob.slice(offset,size));
   if(!r.ok){const t=await r.text();throw new Error('Dropbox finish '+r.status+'：'+t.slice(0,160));}
   return true;
 }
@@ -969,7 +978,9 @@ async function runUpload(rec,which){
     const f2=await dbGet(rec.id); f2.up[which]='done'; f2.up[which+'msg']=''; await dbPut(f2);
   }catch(e){
     console.error(which,e);
-    const f2=await dbGet(rec.id); if(f2){f2.up[which]='err'; f2.up[which+'msg']=String(e.message||e); await dbPut(f2);}
+    let msg=String((e&&e.message)||e);
+    if(/load failed|failed to fetch|networkerror/i.test(msg))msg='網路連線中斷，稍後會自動再試（或按重新上傳）';
+    const f2=await dbGet(rec.id); if(f2){f2.up[which]='err'; f2.up[which+'msg']=msg; await dbPut(f2);}
   }
   refreshHistory();
 }
@@ -1131,6 +1142,16 @@ $('btnConnectG').onclick=async()=>{
   catch(e){ toast('Google 連結失敗：'+(e.message||e)); }
 };
 $('btnConnectD').onclick=()=>{ settings.dAppKey=$('dAppKey').value.trim(); settings.dFolder=$('dFolder').value.trim()||'出貨錄影'; saveSet(); dropboxConnect(); };
+$('btnTestD').onclick=async()=>{
+  if(!tokens.dropboxRefresh){ toast('請先連結 Dropbox'); return; }
+  const btn=$('btnTestD'); const old=btn.textContent; btn.textContent='測試中…';
+  try{
+    const blob=new Blob(['packrec connection test '+new Date().toISOString()],{type:'text/plain'});
+    await dropboxUpload({blob,filename:'_packrec_test.txt'});
+    toast('✓ 上傳測試成功！網路與設定都正常');
+  }catch(e){ toast('✗ 測試失敗：'+String((e&&e.message)||e)); }
+  finally{ btn.textContent=old; }
+};
 $('saveSettings').onclick=()=>{
   settings.gClientId=$('gClientId').value.trim();
   settings.gFolder=$('gFolder').value.trim()||'出貨錄影';
