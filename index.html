@@ -95,6 +95,10 @@
   .rec-item{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px 14px;margin-bottom:10px}
   .rec-item .head{display:flex;align-items:center;gap:10px}
   .batch-bar{display:flex;align-items:center;gap:10px;background:#2a2410;border:1px solid #5e4a1c;border-radius:12px;padding:12px 14px;margin-bottom:12px}
+  .filter-row{display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap}
+  .fchip{font-family:var(--mono);font-size:12px;font-weight:700;padding:9px 13px;border-radius:999px;border:1px solid var(--line);background:var(--panel);color:var(--ink-dim)}
+  .fchip.on{background:var(--scan);color:#0a0d06;border-color:var(--scan)}
+  .fchip.check{margin-left:auto;background:var(--panel-2);color:var(--ink);border-color:var(--line)}
   .batch-bar.ok{background:#13241c;border-color:#1f5e44}
   .batch-txt{flex:1;font-family:var(--mono);font-size:13px;font-weight:700;color:var(--warn)}
   .batch-bar.ok .batch-txt{color:var(--ok)}
@@ -329,7 +333,7 @@
 <script src="https://accounts.google.com/gsi/client" async></script>
 <script>
 "use strict";
-const APP_VERSION='2026-08-12e · 播放修正版';
+const APP_VERSION='2026-08-12g · 降溫版';
 /* =========================================================================
    包貨錄影 — single-file PWA
    Flow: scan barcode -> record (named by order no, optional burned-in
@@ -435,7 +439,26 @@ function combineRaw(vStream,aTrack){
   }catch(_){ return vStream; }
 }
 /* fully release the camera + recording pipeline — prevents the camera being left locked */
+/* keep screen awake while recording (auto screen-lock mid-recording corrupts files) */
+let wakeLock=null;
+async function acquireWakeLock(){ try{ if(navigator.wakeLock&&navigator.wakeLock.request){ wakeLock=await navigator.wakeLock.request('screen'); } }catch(_){} }
+function releaseWakeLock(){ try{ if(wakeLock){ wakeLock.release(); } }catch(_){} wakeLock=null; }
+/* verify a recording actually decodes (catches "has bytes but unplayable" corruption) */
+function verifyPlayable(blob){
+  return new Promise(res=>{
+    let done=false; const v=document.createElement('video'); v.muted=true; v.preload='metadata';
+    let url; try{ url=URL.createObjectURL(blob); }catch(_){ res(false); return; }
+    const fin=(ok)=>{ if(done)return; done=true; try{URL.revokeObjectURL(url);}catch(_){}; res(ok); };
+    v.onloadedmetadata=()=>fin((v.duration>0&&isFinite(v.duration))||v.videoWidth>0);
+    v.onerror=()=>fin(false);
+    setTimeout(()=>fin(false),6000);
+    v.src=url;
+  });
+}
+async function markCorrupt(id){ const r=await dbGet(id); if(r&&!r.corrupt){ r.corrupt=true; await dbPut(r); refreshHistory(); } }
+
 function releaseCamera(){
+  releaseWakeLock();
   stopDraw();
   if(mediaRecorder && mediaRecorder.state!=='inactive'){ try{mediaRecorder.stop();}catch(_){} }
   if(recordStream && recordStream!==stream){ try{recordStream.getTracks().forEach(t=>t.stop());}catch(_){} }
@@ -490,6 +513,7 @@ function ensureZXing(){
   return zxingReader;
 }
 function stopScanEngine(){
+  clearTimeout(scanIdleTimer);
   if(scanRAF){cancelAnimationFrame(scanRAF);scanRAF=null;}
   scanBusy=false;
   if(legacyZxing){
@@ -499,6 +523,13 @@ function stopScanEngine(){
       else if(zxingReader&&typeof zxingReader.stopStreams==='function') zxingReader.stopStreams();
     }catch(_){}
   }
+}
+let scanIdleTimer=null;
+function scanIdleStop(){
+  if(state!=='scanning')return;
+  goIdle();
+  const h=$('idleHint'); if(h)h.innerHTML='<p class="big">掃描已暫停</p><p>為了省電與降溫，掃描閒置 90 秒會自動暫停。請再按「掃描單號」繼續。</p>';
+  toast('已暫停掃描以節省電力');
 }
 
 /* ---------- scan success sound ---------- */
@@ -566,16 +597,27 @@ async function startScan(){
       // let ZXing attach the stream to the <video> and play it — avoids the iOS double-attach black screen
       zxingReader.decodeFromStream(stream,preview,(res)=>{ if(res)onScanned(res.getText()); });
     }
+    clearTimeout(scanIdleTimer); scanIdleTimer=setTimeout(scanIdleStop,90000);
     render();
   }catch(e){ handleCamError(e); }
 }
 
+const scanDown=document.createElement('canvas');
+const scanDownCtx=scanDown.getContext('2d',{willReadFrequently:true});
+let lastScanAt=0;
 async function scanLoop(){
   if(state!=='scanning'||!detector)return;
-  if(!scanBusy && preview.readyState>=2 && preview.videoWidth){
-    scanBusy=true;
+  const now=performance.now();
+  // throttle to ~9 checks/sec, and decode a downscaled copy → far less CPU/heat than full 1080p
+  if(!scanBusy && preview.readyState>=2 && preview.videoWidth && (now-lastScanAt)>=110){
+    scanBusy=true; lastScanAt=now;
     try{
-      const codes=await detector.detect(preview);   // detect on the whole live frame — no fragile cropping
+      const vw=preview.videoWidth, vh=preview.videoHeight;
+      const scale=Math.min(1,800/Math.max(vw,vh));
+      const dw=Math.max(1,Math.round(vw*scale)), dh=Math.max(1,Math.round(vh*scale));
+      scanDown.width=dw; scanDown.height=dh;
+      scanDownCtx.drawImage(preview,0,0,dw,dh);
+      const codes=await detector.detect(scanDown);
       if(codes&&codes.length){ onScanned(codes[0].rawValue); return; }
     }catch(_){}
     scanBusy=false;
@@ -690,6 +732,7 @@ async function startRecording(){
     mediaRecorder.ondataavailable=e=>{if(e.data&&e.data.size)chunks.push(e.data);};
     mediaRecorder.onstop=()=>finishRecording(realMime);
     mediaRecorder.start(1000);
+    acquireWakeLock();
 
     state='recording';
     $('orderTag').textContent=currentOrder;
@@ -760,6 +803,8 @@ async function finishRecording(mime){
   setStatus(`已存檔 <b>${filename}</b>（${humanSize(blob.size)}·${codecTag(mime)}）`);
   checkStorage();
   uploadRecord(rec.id);
+  // integrity check in the background — if the clip won't decode, flag it and warn to re-record now
+  verifyPlayable(blob).then(ok=>{ if(!ok){ markCorrupt(rec.id); toast('⚠ 剛錄的影片可能損壞，建議重錄這一筆'); setStatus('⚠ 剛錄的影片可能損壞，建議重錄'); } });
 }
 
 /* warn before storage runs out (silent save failures are dangerous for evidence) */
@@ -1098,6 +1143,26 @@ async function autoRetryTick(){
 let autoRetryTimer=null;
 function startAutoRetry(){ if(autoRetryTimer)clearInterval(autoRetryTimer); autoRetryTimer=setInterval(autoRetryTick,60000); }
 
+/* scan every saved video and flag the ones that won't play */
+let checkingAll=false;
+let historyFilter='all';   // 'all' | 'problem'
+async function checkAllVideos(){
+  if(checkingAll){ return; }
+  checkingAll=true;
+  const all=await dbAll();
+  toast(`檢查中… 共 ${all.length} 支影片`);
+  let bad=0;
+  for(const r of all){
+    const ok=(await blobReadable(r.blob)) && (await verifyPlayable(r.blob));
+    if(!ok){ bad++; if(!r.corrupt){ r.corrupt=true; await dbPut(r); } }
+    else if(r.corrupt){ r.corrupt=false; await dbPut(r); }
+  }
+  checkingAll=false;
+  if(bad){ historyFilter='problem'; }
+  refreshHistory();
+  toast(bad? `檢查完成：${bad} 支毀損（已標示）`:'✓ 檢查完成：全部影片正常');
+}
+
 /* ========================================================================
    HISTORY VIEW
    ======================================================================== */
@@ -1108,6 +1173,17 @@ async function refreshHistory(){
   if(!all.length){ wrap.innerHTML='<div class="empty">還沒有出貨紀錄。<br>回到「錄影」分頁，掃描第一筆單號吧。</div>'; return; }
   wrap.innerHTML='';
   const esc=s=>String(s||'').replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));
+  const problemCount=all.filter(r=>cloudPending(r)||r.corrupt).length;
+  // filter chips + check-all
+  const fr=document.createElement('div'); fr.className='filter-row';
+  fr.innerHTML=`
+    <button class="fchip ${historyFilter==='all'?'on':''}" data-f="all">全部 ${all.length}</button>
+    <button class="fchip ${historyFilter==='problem'?'on':''}" data-f="problem">未上傳/毀損 ${problemCount}</button>
+    <button class="fchip check" id="checkAll">檢查全部</button>`;
+  wrap.appendChild(fr);
+  fr.querySelectorAll('button[data-f]').forEach(b=>b.onclick=()=>{ historyFilter=b.dataset.f; refreshHistory(); });
+  fr.querySelector('#checkAll').onclick=()=>checkAllVideos();
+
   // batch bar: how many still need uploading
   const pendCount=all.filter(cloudPending).length;
   if(settings.gEnabled||settings.dEnabled){
@@ -1121,7 +1197,10 @@ async function refreshHistory(){
     wrap.appendChild(bar);
     const br=bar.querySelector('#batchRetry'); if(br)br.onclick=()=>retryAllPending();
   }
-  for(const r of all){
+
+  const list = historyFilter==='problem' ? all.filter(r=>cloudPending(r)||r.corrupt) : all;
+  if(!list.length){ const e=document.createElement('div'); e.className='empty'; e.innerHTML= historyFilter==='problem' ? '沒有未上傳或毀損的影片 ✓' : '還沒有出貨紀錄。'; wrap.appendChild(e); return; }
+  for(const r of list){
     const el=document.createElement('div');el.className='rec-item';
     const badge=(label,st,prog)=>{const cls=st==='done'?'ok':st==='err'?'err':st==='up'?'up':'';let ic=st==='done'?'✓':st==='err'?'✗':st==='up'?'⟳':'·';if(st==='up'&&prog)ic='⟳ '+prog+'%';return `<span class="badge ${cls}">${label} ${ic}</span>`;};
     const errs=[];
