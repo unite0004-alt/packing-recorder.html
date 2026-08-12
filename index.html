@@ -333,7 +333,7 @@
 <script src="https://accounts.google.com/gsi/client" async></script>
 <script>
 "use strict";
-const APP_VERSION='2026-08-12h · 逾時保護版';
+const APP_VERSION='2026-08-12j · 記憶體上傳版';
 /* =========================================================================
    包貨錄影 — single-file PWA
    Flow: scan barcode -> record (named by order no, optional burned-in
@@ -934,7 +934,8 @@ async function gUpload(rec,tok){
     method:'POST',headers:{'Authorization':'Bearer '+tok,'Content-Type':'application/json; charset=UTF-8','X-Upload-Content-Type':rec.mime},body:JSON.stringify(meta)});
   if(!init.ok)throw new Error('Drive 初始化失敗 '+init.status);
   const session=init.headers.get('Location');
-  const put=await fetch(session,{method:'PUT',headers:{'Content-Type':rec.mime},body:rec.blob});
+  let body=rec.blob; try{ body=await rec.blob.arrayBuffer(); }catch(_){}
+  const put=await fetch(session,{method:'PUT',headers:{'Content-Type':rec.mime},body});
   if(!put.ok)throw new Error('Drive 上傳失敗 '+put.status);
   return true;
 }
@@ -1020,18 +1021,23 @@ async function dropboxUpload(rec){
   const folder=(settings.dFolder||'').trim();
   const path='/'+(folder?folder.replace(/^\/|\/$/g,'')+'/':'')+rec.filename;
   const blob=rec.blob, size=blob.size;
-  const SINGLE_LIMIT=140*1024*1024;
-  const post=(url,arg,body)=>fetchRetry(url,{method:'POST',headers:{'Authorization':'Bearer '+tok,'Dropbox-API-Arg':dbxEsc(JSON.stringify(arg)),'Content-Type':'application/octet-stream'},body},5);
+  const CHUNK=4*1024*1024;          // small pieces — iOS Safari fails uploading big bodies in one request
+  const SINGLE_LIMIT=CHUNK;         // anything over one chunk uses the resumable session
+  const post=async(url,arg,body)=>{
+    // iOS Safari fails when fetch reads a body sourced from IndexedDB → copy it into memory first
+    let b=body;
+    if(b && typeof b.arrayBuffer==='function'){ try{ b=await b.arrayBuffer(); }catch(_){} }
+    return fetchRetry(url,{method:'POST',headers:{'Authorization':'Bearer '+tok,'Dropbox-API-Arg':dbxEsc(JSON.stringify(arg)),'Content-Type':'application/octet-stream'},body:b},5);
+  };
 
-  // small file → one request (with retry)
+  // tiny file → one request (with retry)
   if(size<=SINGLE_LIMIT){
     const r=await post('https://content.dropboxapi.com/2/files/upload',{path,mode:'add',autorename:true,mute:true},blob);
     if(!r.ok){const t=await r.text();throw new Error('Dropbox '+r.status+'：'+t.slice(0,160));}
     return true;
   }
 
-  // large file → RESUMABLE chunked session (survives repeated network drops)
-  const CHUNK=4*1024*1024;   // small chunks transfer fast; less to redo on a drop
+  // everything else → RESUMABLE chunked session in small 4MB pieces (survives iOS/network limits)
   let sid=null, offset=0;
   if(rec._dbx&&rec._dbx.session_id){ sid=rec._dbx.session_id; offset=rec._dbx.offset||0; }  // resume where we left off
 
