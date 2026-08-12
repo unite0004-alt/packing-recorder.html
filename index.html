@@ -287,6 +287,9 @@
     <p class="hint" style="margin:0 0 4px">把這個網址填到上面兩個雲端的設定裡（JavaScript 來源 / Redirect URI）。</p>
     <div class="urlbox"><code id="originUrl">—</code><button id="copyUrl">複製</button></div>
 
+    <div class="sect" style="margin-top:24px">版本</div>
+    <p class="hint" style="margin:0">目前程式版本：<b id="verLabel" style="font-family:var(--mono);color:var(--scan)">—</b><br>如果這個編號不是最新的，代表還在跑舊版，請關掉分頁重開、或在網址後面加 <b>?v=2</b> 強制更新。</p>
+
   </div>
   <div class="save-bar"><button id="saveSettings">儲存設定</button></div>
 </div>
@@ -321,6 +324,7 @@
 <script src="https://accounts.google.com/gsi/client" async></script>
 <script>
 "use strict";
+const APP_VERSION='2026-08-12 · 續傳版';
 /* =========================================================================
    包貨錄影 — single-file PWA
    Flow: scan barcode -> record (named by order no, optional burned-in
@@ -1143,6 +1147,7 @@ function openDrawer(){
   $('swG').classList.toggle('on',settings.gEnabled);
   $('swD').classList.toggle('on',settings.dEnabled);
   $('originUrl').textContent=redirectUri();
+  { const vl=$('verLabel'); if(vl)vl.textContent=APP_VERSION; }
   $('btnConnectG').classList.toggle('linked',!!gAccess);
   $('btnConnectG').textContent=gAccess?'Google 已連結 ✓':'連結 Google';
   $('btnConnectD').classList.toggle('linked',!!tokens.dropboxRefresh);
