@@ -333,7 +333,7 @@
 <script src="https://accounts.google.com/gsi/client" async></script>
 <script>
 "use strict";
-const APP_VERSION='2026-08-12g · 降溫版';
+const APP_VERSION='2026-08-12h · 逾時保護版';
 /* =========================================================================
    包貨錄影 — single-file PWA
    Flow: scan barcode -> record (named by order no, optional burned-in
@@ -995,8 +995,11 @@ function dbxEsc(s){return s.replace(/[\u007f-\uffff]/g,c=>'\\u'+('0000'+c.charCo
 async function fetchRetry(url,opts,tries){
   tries=tries||4; let lastErr;
   for(let i=0;i<tries;i++){
-    try{ return await fetch(url,opts); }
-    catch(e){ lastErr=e; await new Promise(r=>setTimeout(r,600*(i+1))); }
+    const ctrl=new AbortController();
+    const timer=setTimeout(()=>{try{ctrl.abort();}catch(_){}},60000);   // don't hang forever on a stalled connection
+    try{ return await fetch(url,Object.assign({},opts,{signal:ctrl.signal})); }
+    catch(e){ lastErr=e; await new Promise(r=>setTimeout(r,800*(i+1))); }
+    finally{ clearTimeout(timer); }
   }
   throw lastErr;
 }
