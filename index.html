@@ -912,13 +912,25 @@ async function fetchRetry(url,opts,tries){
   }
   throw lastErr;
 }
+async function saveDbxProgress(id,session_id,offset,total){
+  if(!id)return;
+  const r=await dbGet(id); if(!r)return;
+  r._dbx={session_id,offset};
+  if(r.up)r.up.dprog=total?Math.round(offset/total*100):0;
+  await dbPut(r); refreshHistory();
+}
+async function clearDbxProgress(id){
+  if(!id)return;
+  const r=await dbGet(id); if(!r)return;
+  r._dbx=null; if(r.up)r.up.dprog=null; await dbPut(r);
+}
 async function dropboxUpload(rec){
   const tok=await dropboxToken();
   const folder=(settings.dFolder||'').trim();
   const path='/'+(folder?folder.replace(/^\/|\/$/g,'')+'/':'')+rec.filename;
   const blob=rec.blob, size=blob.size;
   const SINGLE_LIMIT=140*1024*1024;
-  const post=(url,arg,body)=>fetchRetry(url,{method:'POST',headers:{'Authorization':'Bearer '+tok,'Dropbox-API-Arg':dbxEsc(JSON.stringify(arg)),'Content-Type':'application/octet-stream'},body});
+  const post=(url,arg,body)=>fetchRetry(url,{method:'POST',headers:{'Authorization':'Bearer '+tok,'Dropbox-API-Arg':dbxEsc(JSON.stringify(arg)),'Content-Type':'application/octet-stream'},body},5);
 
   // small file → one request (with retry)
   if(size<=SINGLE_LIMIT){
@@ -927,26 +939,41 @@ async function dropboxUpload(rec){
     return true;
   }
 
-  // large file → chunked upload session; smaller chunks survive flaky mobile networks better
-  const CHUNK=8*1024*1024;
-  let r=await post('https://content.dropboxapi.com/2/files/upload_session/start',{close:false},blob.slice(0,Math.min(CHUNK,size)));
-  if(!r.ok){const t=await r.text();throw new Error('Dropbox start '+r.status+'：'+t.slice(0,140));}
-  const sid=(await r.json()).session_id;
-  let offset=Math.min(CHUNK,size);
+  // large file → RESUMABLE chunked session (survives repeated network drops)
+  const CHUNK=4*1024*1024;   // small chunks transfer fast; less to redo on a drop
+  let sid=null, offset=0;
+  if(rec._dbx&&rec._dbx.session_id){ sid=rec._dbx.session_id; offset=rec._dbx.offset||0; }  // resume where we left off
+
+  if(!sid){
+    const first=blob.slice(0,Math.min(CHUNK,size));
+    let r=await post('https://content.dropboxapi.com/2/files/upload_session/start',{close:false},first);
+    if(!r.ok){const t=await r.text();throw new Error('Dropbox start '+r.status+'：'+t.slice(0,140));}
+    sid=(await r.json()).session_id; offset=Math.min(CHUNK,size);
+    await saveDbxProgress(rec.id,sid,offset,size);
+  }
+
   while(offset<size){
     const end=Math.min(offset+CHUNK,size);
     if(end>=size)break;   // final chunk goes to finish
-    r=await post('https://content.dropboxapi.com/2/files/upload_session/append_v2',{cursor:{session_id:sid,offset},close:false},blob.slice(offset,end));
+    let r=await post('https://content.dropboxapi.com/2/files/upload_session/append_v2',{cursor:{session_id:sid,offset},close:false},blob.slice(offset,end));
     if(!r.ok){
       const t=await r.text();
-      const m=t.match(/"correct_offset":\s*(\d+)/);   // resume from Dropbox's expected offset if we drifted
-      if(m){ offset=parseInt(m[1],10); continue; }
+      const m=t.match(/"correct_offset":\s*(\d+)/);
+      if(m){ offset=parseInt(m[1],10); await saveDbxProgress(rec.id,sid,offset,size); continue; }
+      await clearDbxProgress(rec.id);   // session likely dead → next retry starts fresh
       throw new Error('Dropbox append '+r.status+'：'+t.slice(0,140));
     }
     offset=end;
+    await saveDbxProgress(rec.id,sid,offset,size);
   }
-  r=await post('https://content.dropboxapi.com/2/files/upload_session/finish',{cursor:{session_id:sid,offset},commit:{path,mode:'add',autorename:true,mute:true}},blob.slice(offset,size));
-  if(!r.ok){const t=await r.text();throw new Error('Dropbox finish '+r.status+'：'+t.slice(0,160));}
+
+  let r=await post('https://content.dropboxapi.com/2/files/upload_session/finish',{cursor:{session_id:sid,offset},commit:{path,mode:'add',autorename:true,mute:true}},blob.slice(offset,size));
+  if(!r.ok){
+    const t=await r.text();
+    await clearDbxProgress(rec.id);
+    throw new Error('Dropbox finish '+r.status+'：'+t.slice(0,160));
+  }
+  await clearDbxProgress(rec.id);
   return true;
 }
 
@@ -1037,7 +1064,7 @@ async function refreshHistory(){
   }
   for(const r of all){
     const el=document.createElement('div');el.className='rec-item';
-    const badge=(label,st)=>{const cls=st==='done'?'ok':st==='err'?'err':st==='up'?'up':'';const ic=st==='done'?'✓':st==='err'?'✗':st==='up'?'⟳':'·';return `<span class="badge ${cls}">${label} ${ic}</span>`;};
+    const badge=(label,st,prog)=>{const cls=st==='done'?'ok':st==='err'?'err':st==='up'?'up':'';let ic=st==='done'?'✓':st==='err'?'✗':st==='up'?'⟳':'·';if(st==='up'&&prog)ic='⟳ '+prog+'%';return `<span class="badge ${cls}">${label} ${ic}</span>`;};
     const errs=[];
     if(r.up&&r.up.g==='err'&&r.up.gmsg)errs.push('Drive：'+esc(r.up.gmsg));
     if(r.up&&r.up.d==='err'&&r.up.dmsg)errs.push('Dropbox：'+esc(r.up.dmsg));
@@ -1046,7 +1073,7 @@ async function refreshHistory(){
       <div class="meta">${stamp(new Date(r.createdAt))} · ${humanSize(r.size)} · ${codecTag(r.mime)} · ${esc(r.filename)}</div>
       <div class="badges">
         ${settings.gEnabled?badge('Drive',r.up&&r.up.g):''}
-        ${settings.dEnabled?badge('Dropbox',r.up&&r.up.d):''}
+        ${settings.dEnabled?badge('Dropbox',r.up&&r.up.d,r.up&&r.up.dprog):''}
         ${(!settings.gEnabled&&!settings.dEnabled)?'<span class="badge">本機已存</span>':''}
       </div>
       ${errs.length?`<div class="err-msg">${errs.join('<br>')}</div>`:''}
