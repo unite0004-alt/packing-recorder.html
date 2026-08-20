@@ -99,6 +99,10 @@
   .fchip{font-family:var(--mono);font-size:12px;font-weight:700;padding:9px 13px;border-radius:999px;border:1px solid var(--line);background:var(--panel);color:var(--ink-dim)}
   .fchip.on{background:var(--scan);color:#0a0d06;border-color:var(--scan)}
   .fchip.check{margin-left:auto;background:var(--panel-2);color:var(--ink);border-color:var(--line)}
+  .fchip.clean{background:var(--panel-2);color:var(--warn);border-color:#5e4a1c}
+  .storage-line{font-family:var(--mono);font-size:11.5px;color:var(--ink-dim);margin:-4px 2px 12px}
+  .storage-line.warn{color:var(--warn)}
+  .storage-line b{color:var(--ink)}
   .batch-bar.ok{background:#13241c;border-color:#1f5e44}
   .batch-txt{flex:1;font-family:var(--mono);font-size:13px;font-weight:700;color:var(--warn)}
   .batch-bar.ok .batch-txt{color:var(--ok)}
@@ -250,6 +254,8 @@
 
     <div class="toggle"><div><div class="t-txt">自動檢查並補傳</div><div class="t-sub">每分鐘自動檢查，發現沒傳成功的就自動重新上傳</div></div><div class="sw on" id="swAutoRetry"></div></div>
 
+    <div class="toggle"><div><div class="t-txt">上傳成功後清除本機檔案</div><div class="t-sub">傳上雲端後刪掉手機裡的影片，避免佔滿空間（清除後「查看影片」要到雲端看）</div></div><div class="sw on" id="swAutoClean"></div></div>
+
     <div class="field">
       <label>Google Drive</label>
       <p class="hint">貼上你自己的 OAuth Client ID，影片只會傳到你的 Google Drive。下方有設定教學。</p>
@@ -333,7 +339,7 @@
 <script src="https://accounts.google.com/gsi/client" async></script>
 <script>
 "use strict";
-const APP_VERSION='2026-08-12k · 全螢幕測試版';
+const APP_VERSION='2026-08-12L · 空間清理版';
 /* =========================================================================
    包貨錄影 — single-file PWA
    Flow: scan barcode -> record (named by order no, optional burned-in
@@ -353,7 +359,7 @@ function humanSize(b){if(!b) return '—';const u=['B','KB','MB','GB'];let i=0;w
 
 /* ---------- settings (localStorage) ---------- */
 const SET_KEY='packrec.settings.v1';
-const defaults={watermark:true,audio:true,autoRec:false,hq:false,beep:true,autoRetry:true,gClientId:'',gFolder:'出貨錄影',gEnabled:false,dAppKey:'',dFolder:'出貨錄影',dEnabled:false};
+const defaults={watermark:true,audio:true,autoRec:false,hq:false,beep:true,autoRetry:true,autoClean:true,gClientId:'',gFolder:'出貨錄影',gEnabled:false,dAppKey:'',dFolder:'出貨錄影',dEnabled:false};
 let settings=Object.assign({},defaults,JSON.parse(localStorage.getItem(SET_KEY)||'{}'));
 function saveSet(){localStorage.setItem(SET_KEY,JSON.stringify(settings));}
 
@@ -848,8 +854,12 @@ async function openPlayer(id){
   show($('bigPlay'),true);          // always show a tappable play button until it actually plays
   $('player').classList.add('open');
   // corrupt / unreadable file → show a clear message instead of a black screen
+  if(rec.cleaned || !rec.blob){
+    show($('bigPlay'),false); $('playerErr').innerHTML='☁ 本機檔案已清除<br>（已上傳雲端，請至雲端查看）'; show($('playerErr'),true);
+    return;
+  }
   if(!(await blobReadable(rec.blob)) || rec.corrupt){
-    show($('bigPlay'),false); show($('playerErr'),true);
+    show($('bigPlay'),false); $('playerErr').innerHTML='⚠ 此影片無法播放<br>（檔案可能已毀損）'; show($('playerErr'),true);
     return;
   }
   if(playerURL){ URL.revokeObjectURL(playerURL); playerURL=null; }
@@ -1084,6 +1094,7 @@ async function blobReadable(blob){
 }
 async function uploadRecord(id){
   const rec=await dbGet(id); if(!rec)return;
+  if(rec.cleaned){ return; }   // local file already cleared after a successful upload
   // corrupt file → don't waste retries; flag it so it's obvious it needs re-recording
   if(!(await blobReadable(rec.blob))){
     rec.corrupt=true;
@@ -1107,7 +1118,27 @@ async function uploadRecord(id){
   if(settings.gEnabled)parts.push('Drive '+(r2.up.g==='done'?'✓':'✗'));
   if(settings.dEnabled)parts.push('Dropbox '+(r2.up.d==='done'?'✓':'✗'));
   setStatus(parts.join('　')||'已存檔');
+  await maybeAutoClean(id);
   refreshHistory();
+}
+/* delete the local video once every enabled cloud has it (keeps the record, frees the space) */
+async function maybeAutoClean(id){
+  if(!settings.autoClean)return;
+  const r=await dbGet(id); if(!r||r.cleaned||!r.blob)return;
+  if(!(settings.gEnabled||settings.dEnabled))return;
+  const gOk=!settings.gEnabled || r.up.g==='done';
+  const dOk=!settings.dEnabled || r.up.d==='done';
+  if(gOk&&dOk){ r.blob=null; r.cleaned=true; r._dbx=null; if(r.up)r.up.dprog=null; await dbPut(r); }
+}
+/* manually clear local copies of everything already uploaded */
+async function cleanUploaded(){
+  const all=await dbAll();
+  const targets=all.filter(r=>r.blob&&!r.cleaned&&!r.corrupt&&(settings.gEnabled||settings.dEnabled)&&!cloudPending(r));
+  if(!targets.length){ toast('沒有可清除的已上傳影片'); return; }
+  if(!confirm(`清除 ${targets.length} 支「已成功上傳」影片的手機檔案？\n（雲端仍保留，可釋放空間；此後這幾支要到雲端才看得到）`))return;
+  for(const r of targets){ r.blob=null; r.cleaned=true; r._dbx=null; if(r.up)r.up.dprog=null; await dbPut(r); }
+  refreshHistory(); checkStorage();
+  toast(`已清除 ${targets.length} 支的手機檔案，空間已釋放`);
 }
 async function runUpload(rec,which){
   const fresh=await dbGet(rec.id); if(!fresh)return;
@@ -1162,6 +1193,7 @@ async function checkAllVideos(){
   toast(`檢查中… 共 ${all.length} 支影片`);
   let bad=0;
   for(const r of all){
+    if(r.cleaned||!r.blob)continue;   // already uploaded & cleared locally — nothing to check
     const ok=(await blobReadable(r.blob)) && (await verifyPlayable(r.blob));
     if(!ok){ bad++; if(!r.corrupt){ r.corrupt=true; await dbPut(r); } }
     else if(r.corrupt){ r.corrupt=false; await dbPut(r); }
@@ -1188,10 +1220,23 @@ async function refreshHistory(){
   fr.innerHTML=`
     <button class="fchip ${historyFilter==='all'?'on':''}" data-f="all">全部 ${all.length}</button>
     <button class="fchip ${historyFilter==='problem'?'on':''}" data-f="problem">未上傳/毀損 ${problemCount}</button>
-    <button class="fchip check" id="checkAll">檢查全部</button>`;
+    <button class="fchip check" id="checkAll">檢查全部</button>
+    <button class="fchip clean" id="cleanUp">清除已上傳</button>`;
   wrap.appendChild(fr);
   fr.querySelectorAll('button[data-f]').forEach(b=>b.onclick=()=>{ historyFilter=b.dataset.f; refreshHistory(); });
   fr.querySelector('#checkAll').onclick=()=>checkAllVideos();
+  fr.querySelector('#cleanUp').onclick=()=>cleanUploaded();
+  // storage usage line
+  const su=document.createElement('div'); su.className='storage-line'; su.id='storageLine'; su.textContent='本機空間計算中…';
+  wrap.appendChild(su);
+  if(navigator.storage&&navigator.storage.estimate){
+    navigator.storage.estimate().then(({usage,quota})=>{
+      const gb=b=>(b/1073741824).toFixed(2);
+      const pct=quota?Math.round(usage/quota*100):0;
+      su.innerHTML=`本機影片約佔 <b>${gb(usage)} GB</b>（可用上限約 ${gb(quota)} GB，已用 ${pct}%）`;
+      if(pct>=80)su.classList.add('warn');
+    }).catch(()=>{ su.textContent=''; });
+  }
 
   // batch bar: how many still need uploading
   const pendCount=all.filter(cloudPending).length;
@@ -1220,6 +1265,7 @@ async function refreshHistory(){
       <div class="meta">${stamp(new Date(r.createdAt))} · ${humanSize(r.size)} · ${codecTag(r.mime)} · ${esc(r.filename)}</div>
       <div class="badges">
         ${r.corrupt?'<span class="badge err">⚠ 檔案毀損</span>':''}
+        ${r.cleaned?'<span class="badge ok">☁ 本機已清除</span>':''}
         ${settings.gEnabled?badge('Drive',r.up&&r.up.g):''}
         ${settings.dEnabled?badge('Dropbox',r.up&&r.up.d,r.up&&r.up.dprog):''}
         ${(!settings.gEnabled&&!settings.dEnabled)?'<span class="badge">本機已存</span>':''}
@@ -1291,6 +1337,7 @@ function openDrawer(){
   $('swHQ').classList.toggle('on',settings.hq);
   $('swBeep').classList.toggle('on',settings.beep);
   $('swAutoRetry').classList.toggle('on',settings.autoRetry);
+  $('swAutoClean').classList.toggle('on',settings.autoClean);
   $('swAudio').classList.toggle('on',settings.audio);
   $('swAutoRec').classList.toggle('on',settings.autoRec);
   $('swG').classList.toggle('on',settings.gEnabled);
@@ -1311,6 +1358,7 @@ bindSwitch($('swWatermark'),'watermark');
 bindSwitch($('swHQ'),'hq');
 bindSwitch($('swBeep'),'beep');
 bindSwitch($('swAutoRetry'),'autoRetry',()=>{ if(settings.autoRetry)autoRetryTick(); });
+bindSwitch($('swAutoClean'),'autoClean');
 bindSwitch($('swAudio'),'audio');
 bindSwitch($('swAutoRec'),'autoRec');
 bindSwitch($('swG'),'gEnabled',refreshDots);
