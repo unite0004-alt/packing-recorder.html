@@ -339,7 +339,7 @@
 <script src="https://accounts.google.com/gsi/client" async></script>
 <script>
 "use strict";
-const APP_VERSION='2026-08-12L · 空間清理版';
+const APP_VERSION='2026-08-12m · 對焦修正版';
 /* =========================================================================
    包貨錄影 — single-file PWA
    Flow: scan barcode -> record (named by order no, optional burned-in
@@ -474,6 +474,20 @@ function releaseCamera(){
   mediaRecorder=null;
 }
 function waitForDims(v){return new Promise(res=>{ if(v.videoWidth&&v.videoHeight)return res(); const t=setTimeout(res,1200); v.addEventListener('loadedmetadata',()=>{clearTimeout(t);res();},{once:true}); });}
+
+/* re-enable continuous autofocus on the current stream (fixes lens stuck at close scan distance) */
+async function applyContinuousFocus(){
+  if(!stream)return;
+  try{
+    const track=stream.getVideoTracks()[0];
+    if(!track||!track.getCapabilities)return;
+    const caps=track.getCapabilities();
+    const adv=[];
+    if(caps.focusMode&&caps.focusMode.includes('continuous'))adv.push({focusMode:'continuous'});
+    if(caps.exposureMode&&caps.exposureMode.includes('continuous'))adv.push({exposureMode:'continuous'});
+    if(adv.length)await track.applyConstraints({advanced:adv});
+  }catch(_){}
+}
 
 /* tap the live view to refocus (supported mainly on Android Chrome; harmless elsewhere) */
 async function tapFocus(ev){
@@ -681,15 +695,14 @@ function extFor(mime){return /mp4/.test(mime)?'mp4':'webm';}
 /* ---------- RECORD ---------- */
 async function startRecording(){
   try{
-    // reuse the live scan camera if possible (fast hand-off); otherwise open it (video only)
-    const vt=stream&&stream.getVideoTracks&&stream.getVideoTracks()[0];
-    if(!(vt&&vt.readyState==='live')){
-      setStatus('啟動相機…');
-      stopStream();
-      stream=await getCamera(false);
-    }
+    // open a FRESH camera for recording. Reusing the scan stream leaves the lens focused at the
+    // close QR-scan distance → blurry at normal distance. A fresh stream refocuses for the scene.
+    setStatus('啟動相機…');
+    stopStream();
+    stream=await getCamera(false);
     preview.srcObject=stream; preview.muted=true; await preview.play().catch(()=>{});
     await waitForDims(preview);
+    applyContinuousFocus();   // belt-and-suspenders: also request continuous AF where supported
 
     // grab the mic separately — this never blocks the camera, and if it fails we just record silently
     let audioTrack=null;
