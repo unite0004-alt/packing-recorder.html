@@ -339,7 +339,7 @@
 <script src="https://accounts.google.com/gsi/client" async></script>
 <script>
 "use strict";
-const APP_VERSION='2026-08-12m · 對焦修正版';
+const APP_VERSION='2026-08-12n · XHR上傳版';
 /* =========================================================================
    包貨錄影 — single-file PWA
    Flow: scan barcode -> record (named by order no, optional burned-in
@@ -1027,6 +1027,28 @@ async function fetchRetry(url,opts,tries){
   }
   throw lastErr;
 }
+/* XHR upload — far more reliable than fetch for large bodies on iOS Safari */
+function xhrRequest(url,headers,body,timeoutMs){
+  return new Promise((resolve,reject)=>{
+    const xhr=new XMLHttpRequest();
+    try{ xhr.open('POST',url,true); }catch(e){ reject(e); return; }
+    try{ for(const k in headers) xhr.setRequestHeader(k,headers[k]); }catch(e){ reject(e); return; }
+    xhr.timeout=timeoutMs||120000;
+    xhr.onload=()=>resolve({ok:xhr.status>=200&&xhr.status<300,status:xhr.status,text:()=>Promise.resolve(xhr.responseText||''),json:()=>{try{return Promise.resolve(JSON.parse(xhr.responseText||'{}'));}catch(_){return Promise.resolve({});}}});
+    xhr.onerror=()=>reject(new Error('Load failed'));
+    xhr.ontimeout=()=>reject(new Error('上傳逾時'));
+    xhr.onabort=()=>reject(new Error('已中斷'));
+    try{ xhr.send(body); }catch(e){ reject(e); }
+  });
+}
+async function xhrRetry(url,headers,body,tries){
+  tries=tries||5; let lastErr;
+  for(let i=0;i<tries;i++){
+    try{ return await xhrRequest(url,headers,body); }
+    catch(e){ lastErr=e; await new Promise(r=>setTimeout(r,800*(i+1))); }
+  }
+  throw lastErr;
+}
 async function saveDbxProgress(id,session_id,offset,total){
   if(!id)return;
   const r=await dbGet(id); if(!r)return;
@@ -1047,10 +1069,11 @@ async function dropboxUpload(rec){
   const CHUNK=4*1024*1024;          // small pieces — iOS Safari fails uploading big bodies in one request
   const SINGLE_LIMIT=CHUNK;         // anything over one chunk uses the resumable session
   const post=async(url,arg,body)=>{
-    // iOS Safari fails when fetch reads a body sourced from IndexedDB → copy it into memory first
+    // copy the body into memory (iOS fetch/XHR both choke reading straight from IndexedDB)
     let b=body;
     if(b && typeof b.arrayBuffer==='function'){ try{ b=await b.arrayBuffer(); }catch(_){} }
-    return fetchRetry(url,{method:'POST',headers:{'Authorization':'Bearer '+tok,'Dropbox-API-Arg':dbxEsc(JSON.stringify(arg)),'Content-Type':'application/octet-stream'},body:b},5);
+    const headers={'Authorization':'Bearer '+tok,'Dropbox-API-Arg':dbxEsc(JSON.stringify(arg)),'Content-Type':'application/octet-stream'};
+    return xhrRetry(url,headers,b,5);   // XHR is far more reliable than fetch for uploads on iOS Safari
   };
 
   // tiny file → one request (with retry)
