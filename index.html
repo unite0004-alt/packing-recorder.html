@@ -339,7 +339,7 @@
 <script src="https://accounts.google.com/gsi/client" async></script>
 <script>
 "use strict";
-const APP_VERSION='2026-08-12n · XHR上傳版';
+const APP_VERSION='2026-08-12o · 雲端回放版';
 /* =========================================================================
    包貨錄影 — single-file PWA
    Flow: scan barcode -> record (named by order no, optional burned-in
@@ -866,9 +866,23 @@ async function openPlayer(id){
   show($('playerErr'),false);
   show($('bigPlay'),true);          // always show a tappable play button until it actually plays
   $('player').classList.add('open');
-  // corrupt / unreadable file → show a clear message instead of a black screen
+  // local copy was cleared after upload → stream it back from Dropbox
   if(rec.cleaned || !rec.blob){
-    show($('bigPlay'),false); $('playerErr').innerHTML='☁ 本機檔案已清除<br>（已上傳雲端，請至雲端查看）'; show($('playerErr'),true);
+    if(rec.dbxPath && tokens.dropboxRefresh){
+      show($('bigPlay'),false);
+      $('playerErr').innerHTML='☁ 從雲端載入中…'; show($('playerErr'),true);
+      try{
+        const link=await dropboxTempLink(rec.dbxPath);
+        if(playerURL){ URL.revokeObjectURL(playerURL); playerURL=null; }
+        show($('playerErr'),false); show($('bigPlay'),true);
+        v.src=link; try{ v.load(); }catch(_){}
+        try{ await v.play(); }catch(_){}
+      }catch(e){
+        show($('bigPlay'),false); $('playerErr').innerHTML='☁ 無法從雲端載入<br>（請檢查網路，或直接到 Dropbox 查看）'; show($('playerErr'),true);
+      }
+      return;
+    }
+    show($('bigPlay'),false); $('playerErr').innerHTML='☁ 本機檔案已清除<br>（請直接到 Dropbox 查看）'; show($('playerErr'),true);
     return;
   }
   if(!(await blobReadable(rec.blob)) || rec.corrupt){
@@ -1080,7 +1094,7 @@ async function dropboxUpload(rec){
   if(size<=SINGLE_LIMIT){
     const r=await post('https://content.dropboxapi.com/2/files/upload',{path,mode:'add',autorename:true,mute:true},blob);
     if(!r.ok){const t=await r.text();throw new Error('Dropbox '+r.status+'：'+t.slice(0,160));}
-    return true;
+    const m=await r.json().catch(()=>({})); return m.path_lower||m.path_display||path;
   }
 
   // everything else → RESUMABLE chunked session in small 4MB pieces (survives iOS/network limits)
@@ -1117,7 +1131,15 @@ async function dropboxUpload(rec){
     throw new Error('Dropbox finish '+r.status+'：'+t.slice(0,160));
   }
   await clearDbxProgress(rec.id);
-  return true;
+  const m=await r.json().catch(()=>({})); return m.path_lower||m.path_display||path;
+}
+/* get a temporary streaming URL for a file already in Dropbox (for cloud playback) */
+async function dropboxTempLink(path){
+  const tok=await dropboxToken();
+  const r=await xhrRequest('https://api.dropboxapi.com/2/files/get_temporary_link',{'Authorization':'Bearer '+tok,'Content-Type':'application/json'},JSON.stringify({path}),30000);
+  if(!r.ok)throw new Error('取得雲端連結失敗 '+r.status);
+  const j=await r.json(); if(!j.link)throw new Error('雲端連結無效');
+  return j.link;
 }
 
 /* ========================================================================
@@ -1180,9 +1202,10 @@ async function runUpload(rec,which){
   const fresh=await dbGet(rec.id); if(!fresh)return;
   fresh.up[which]='up'; await dbPut(fresh); refreshHistory();
   try{
+    let dpath=null;
     if(which==='g'){ const tok=await gToken(false); await gUpload(fresh,tok); }
-    else{ await dropboxUpload(fresh); }
-    const f2=await dbGet(rec.id); f2.up[which]='done'; f2.up[which+'msg']=''; await dbPut(f2);
+    else{ dpath=await dropboxUpload(fresh); }
+    const f2=await dbGet(rec.id); f2.up[which]='done'; f2.up[which+'msg']=''; if(which==='d'&&typeof dpath==='string')f2.dbxPath=dpath; await dbPut(f2);
   }catch(e){
     console.error(which,e);
     let msg=String((e&&e.message)||e);
